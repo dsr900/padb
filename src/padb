@@ -28,42 +28,6 @@
 
 # Revision history
 
-# Version 3.3
-#  * Add a 'launch-mode' option to controll the back-end used to launch
-#    the inner processes, previously padb would use the underlying resource
-#    manager if possible and pdsh if not, now this is configurable and
-#    padb can be told to use either, the resource manager, pdsh or clush.
-#    The default setting for this value is "local,rmgr,ssh,pdsh,clush" which
-#    mimics the old behaviour but offers the user more choice about the
-#    specifics
-#  * Change the default to be not to show paramaters and locals in
-#    stack traces, it's very useful to have but adds a lot of noise
-#    which makes it harder to spot simple problems.
-#  * Add proper support for viewing stack traces in threaded
-#    programmes, show a full tree-based stack view for each thread-id
-#  * Add limited for LSF jobs.
-#  * Better handling of gdb errors, add a catch-all signal handler
-#    for sigpipe such that if any undetected error occours we can
-#    report it rather than crash.
-#  * Detect errors introduced by the "yama" security feature in new
-#    kernels, this prevents padb from attaching to running jobs if
-#    it's enabled.
-#  * Convert between hostnames and fully-qualified-domain-names as
-#    required to work on systems which use either or a combination
-#    of both.
-#  * Sort values properly in proc-summary mode, if a value is numeric
-#    for all ranks then do a numberical sort, otherwise perform a
-#    dictionary sort.
-#  * Modify the PBS resource manager to also work on Torque.  These
-#    two resource managers are fundamentally the same but differ
-#    slightly in the command line options they accept.
-#  * Build fixes for edb (For Quadrics systems)
-#  * Fix a problem with reading MPI message queues from Fortran programmes,
-#    switch gdb into the 'c' language mode when required rather than just
-#    using the default all the time.
-#  * Fix orte support for systems where OpenMPI was built with check-point
-#    restart enabled.
-#
 # Version 3.2
 #  * Support of PBS Pro
 #  * Support for OpenMPI jobs run by mpirun under a slurm allocation.
@@ -121,7 +85,7 @@
 #    callback handle it.  This means that persistent attachments can
 #    be used in full-report mode.
 #  * Speed up attaching gdb to the target job greatly by attaching to
-#    all target processes on a node simultanously rather than one at
+#    all target processes on a not simultanously rather than one at
 #    a time.
 #  * Better handling of jobs that dissapear whilst we are monitoring them,
 #    there should be no perl errors shown if this happens.
@@ -347,12 +311,28 @@ use Config;
 use IO::Socket;
 use IO::Select;
 use Carp;
+### dsr900
+use POSIX qw(getgroups);
 
 ###############################################################################
 #
 # Header.
 #
 ###############################################################################
+
+#Jie's Trace define
+
+my $padb_trace = undef;
+if ( defined $ENV{'PADB_ENABLE_TRACE'} ) {
+    $padb_trace=1;
+}
+my $padb_debug = undef;
+if ( defined $ENV{'PADB_ENABLE_DEBUG'} ) {
+    $padb_debug=1;
+}
+# Jie's pbs support...
+my $pbs_in_use=1;
+#endof Jie's Trace define
 
 # Formatted with the command 'perltidy -b -ce -w padb' to maintain a
 # vaguely readable form.
@@ -378,7 +358,7 @@ use Carp;
 # Inner
 # Main.
 
-my $svn_revision_string = '$Revision$';
+my $svn_revision_string = '$Revision: 416 $';
 my $svn_revision        = 'unknown';
 
 if ( $svn_revision_string =~ m{(\d+)} ) {
@@ -386,7 +366,7 @@ if ( $svn_revision_string =~ m{(\d+)} ) {
 }
 
 my $prog    = basename $0;
-my $version = "3.3 (Revision $svn_revision)";
+my $version = "3.2 (Revision $svn_revision)";
 
 my %conf;
 
@@ -407,7 +387,7 @@ if ( -d '/proc/1/path' ) {
 # Config options the inner knows about, only forward options if they are in
 # this list.
 my @inner_conf =
-  qw(edb edbopt rmgr scripts slurm_job_step pbs_server lsf_mode lsfmpi_server lsfmpi_mpirpid lsfmpi_port backend_debugger);
+  qw(edb edbopt rmgr scripts slurm_job_step pbs_server lsf_mode lsfmpi_server lsfmpi_mpirpid lsfmpi_port);
 
 # More options the inner knows about, these are forwarded on the
 # command line rather than over the sockets.
@@ -601,9 +581,6 @@ $conf{orte_job_step}  = undef;
 
 $conf{pbs_server} = undef;
 
-# Backend debugger to use, can be either idb or gdb.
-$conf{backend_debugger} = 'gdb';
-
 # These settings are passed onto inner only.
 $conf{edbopt} = undef;
 
@@ -614,19 +591,12 @@ $conf{port_range} = undef;
 
 $conf{tree_width} = '4';
 
-# The number of elements to display when showing rankspec in tree displays.
-# By elements here it means each comma seperated block, hence [1,3-4,6-7] counts
-# as a rankspec_length of 3.  Rankspecs which have more elements than this value
-# are truncated at this value and an ellipses is shown to indicate there is missing
-# data.  A value of 0 means never truncate rankspecs.
-$conf{rankspec_length} = '5';
-
-# The number of spaces to indent each new level by when displaying trees.  This
-# value used to be 2 until I added the indentation count in the left column, now
-# we have that reduce this number to use less screen space.
-$conf{tree_indent} = '1';
-
 $conf{launch_mode} = 'local,rmgr,ssh,pdsh,clush';
+
+# NCI PBS Namespace joining options
+$conf{privileged_group} = undef;
+
+$conf{ns_join_app} = undef;
 
 # Config options which take boolean values.
 my @conf_bool = qw(watch_clears_screen inner_callback);
@@ -635,12 +605,15 @@ my @conf_bool = qw(watch_clears_screen inner_callback);
 my @conf_time = qw(prun_exittimeout prun_timeout interval);
 
 # Config options which take an integer.
-my @conf_int =
-  qw(lsf_job_offset slurm_job_step orte_job_step tree_width rankspec_length tree_indent);
+my @conf_int = qw(lsf_job_offset slurm_job_step orte_job_step tree_width);
 
 my $norc       = 0;
-my $configfile = '/etc/padb.conf';
-
+my $configfile;
+if ( defined $ENV{'PADB_CONF_FILE'}) {
+    $configfile = $ENV{'PADB_CONF_FILE'};
+} else {
+    $configfile = '../etc/padb.conf';
+}
 # Standard regexpes for splitting on comma, equals and spaces.  Note the
 # space regexp matches multiple whitespace characters.
 my $COMMA  = qr{,}x;
@@ -657,6 +630,11 @@ $Data::Dumper::Quotekeys = 0;
 
 sub check_and_convert_bool {
     my ($str)    = @_;
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: check_and_convert_bool($str).\n";
+    }
+#endif
     my @enabled  = qw(1 yes on true enabled);
     my @disabled = qw(0 no off false disabled);
     my %bool_table;
@@ -672,6 +650,13 @@ sub check_and_convert_bool {
 
 sub check_and_convert_time {
     my ($str) = @_;
+
+#Jie's Tracing
+    if (defined $padb_trace) {
+	print "padb_trace: check_and_convert_time($str).\n";
+    }
+#endif
+
     if (
         $str =~ m{\A      # Start of line
                   (\d+)   # A number
@@ -688,18 +673,19 @@ sub check_and_convert_time {
     exit 1;
 }
 
-sub is_digit {
-    my ($str) = @_;
-
-    return $str =~ m{\A     # Start of line
-		   \d+    # A number
-		   \z}x
-}
-
 sub check_int {
     my ($str) = @_;
-
-    return if ( is_digit($str) );
+#Jie's Tracing
+    if (defined $padb_trace) {
+	print "padb_trace: check_int($str).\n";
+    }
+#endif
+    return
+      if (
+        $str =~ m{\A     # Start of line
+                  \d+    # A number
+                  \z}x
+      );
 
     printf {*STDERR} "Integer value \"%s\" not recognised, aborting.\n", $str;
     exit 1;
@@ -707,7 +693,11 @@ sub check_int {
 
 sub check_signal {
     my ($signal) = @_;
-
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: check_signal($signal).\n";
+    }
+#endif
     my $s = uc $signal;
     my %sig_names;
     foreach ( split $SPACE, $Config{sig_name} ) {
@@ -724,6 +714,11 @@ sub check_signal {
 
 # Look for edb in the default install location only.
 sub find_edb {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: find_edb().\n";
+    }
+#endif
     return '/usr/lib/qsnet/elan4/bin/'
       if ( -d '/usr/lib/qsnet/elan4/bin/' );
     return '/usr/lib64/qsnet/elan4/bin/'
@@ -736,6 +731,11 @@ sub find_edb {
 # installed to.  If that's not the case or it's not there then look in the
 # same directory as padb is running from.
 sub find_minfo {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: find_minfo(@_).\n";
+    }
+#endif
     my $self = $0;
     if ( $self =~ m{\A(.+)/bin/padb\z} ) {
         my $dir = $1;
@@ -754,6 +754,11 @@ sub find_minfo {
 ###############################################################################
 
 sub show_version {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: show_version().\n";
+    }
+#endif
     print "$prog version $version\n\n";
     print "Written by Ashley Pittman\n";
     print "http://padb.pittman.org.uk\n";
@@ -792,7 +797,7 @@ XXXX
 
 -O [opt1=val,<opt2=val>] Set internal config options for padb, advanced use only.
   Options in this version (these are liable to change)
-  Use -Ohelp=1 for showing current settings
+  Use -Ohelp for showing current settings
 
   General options:
   verbose              Set verbosity level.
@@ -829,6 +834,11 @@ XXXX
 EOF
 
 sub usage {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: usage().\n";
+    }
+#endif
     chomp $usage;
 
     my $extra = $EMPTY_STRING;
@@ -913,7 +923,11 @@ my $debug_fd;
 
 sub set_debug_file {
     my ($filename) = @_;
-
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: set_debug_file($filename).\n";
+    }
+#endif
     if ( defined $filename ) {
         if ( not open $debug_fd, '>', $filename ) {
             print "Unable to open log file for writing: $!\n";
@@ -927,6 +941,11 @@ sub set_debug_file {
 }
 
 sub debug_log {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: debug_log(@_).\n";
+    }
+#endif
     my ( $type, $handle, $str, @params ) = @_;
     if ( not exists $debug_modes{$type} ) {
         print "Unknown debug mode: $type\n";
@@ -956,6 +975,11 @@ $debug_modes{config}      = undef;
 $debug_modes{pcmd}        = undef;
 
 sub slurp_file {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: slurp_file(@_).\n";
+    }
+#endif
     my ($file) = @_;
     open my $FD, '<', $file or return;
     my @contents = <$FD>;
@@ -964,6 +988,11 @@ sub slurp_file {
 }
 
 sub slurp_cmd {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: slurp_cmd(@_).\n";
+    }
+#endif
     my ($cmd) = @_;
     open my $CFD, '-|', "$cmd 2>/dev/null" or return;
     my @out = <$CFD>;
@@ -972,12 +1001,22 @@ sub slurp_cmd {
 }
 
 sub slurp_remote_cmd {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: slurp_remote_cmd(@_).\n";
+    }
+#endif
     my ( $host, $cmd ) = @_;
     return slurp_cmd("ssh $host $cmd");
 }
 
 sub slurp_dir {
     my ($dir) = @_;
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: slurp_dir($dir).\n";
+    }
+#endif
     opendir my $DIR, $dir or return;
     my @files = readdir $DIR;
     closedir $DIR;
@@ -987,6 +1026,11 @@ sub slurp_dir {
 # Return an array of current processes for a given user.
 sub get_process_list {
     my ($user) = @_;
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: get_process_list($user).\n";
+    }
+#endif
     if ($running_on_solaris) {
         my @procs = slurp_cmd("ps -o pid= -u $user");
         chomp @procs;
@@ -1019,6 +1063,11 @@ sub get_process_list {
 # and containing the parent pid for the given process.
 sub get_extended_process_list {
     my ($user) = @_;
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: get_extended_process_list($user).\n";
+    }
+#endif
     if ($running_on_solaris) {
         my @procs = slurp_cmd("ps -o pid= -o ppid= -u $user");
         my %procs;
@@ -1059,6 +1108,11 @@ sub get_extended_process_list {
 }
 
 sub parse_args_outer {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: parse_args_outer.\n";
+    }
+#endif
 
     Getopt::Long::Configure( 'bundling', 'pass_through' );
     my $debugflag;
@@ -1158,7 +1212,7 @@ sub parse_args_outer {
         $rank_rng = rng_convert_from_user( shift @ranks );
 
         foreach my $rank (@ranks) {
-            $rank_rng = rng_merge( $rank_rng, rng_convert_from_user($rank) );
+            rng_merge( $rank_rng, rng_convert_from_user($rank) );
         }
     }
 
@@ -1394,8 +1448,7 @@ sub estats_show_bin {
                 $scale++;
             }
 
-            $ret .=
-              sprintf
+            $ret .= sprintf
 "%16s: min $d->{$bin}{raw}[32] max $d->{$bin}{raw}[33] total $d->{$bin}{raw}[34] (%0.2f $scales[$scale])\n",
               $d->{$bin}{name}, $total;
 
@@ -2056,6 +2109,11 @@ sub estats_show_stats {
 ###############################################################################
 
 sub group_status_helper {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	print "padb_trace: group_status_helper(@_).\n";
+    }
+#endif
     my $str        = shift;    # tagged onto the end of the line.
     my $possessive = shift;    # syntax to use (possessive/attributive)
     my $size       = shift;    # size of the group
@@ -2084,6 +2142,11 @@ sub group_status_helper {
 }
 
 sub group_status {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: group_status(@_).\n";
+    }
+#endif
     my $data_structures_aref = shift;
 
     my %ad;
@@ -2296,6 +2359,12 @@ sub group_status {
 ###############################################################################
 
 sub local_stats_from_job {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: local_stats_from_job().\n";
+    }
+#endif
+
     my $job = shift;
 
     print "Showing local job $job\n";
@@ -2327,6 +2396,12 @@ sub local_stats_from_job {
 
 # Show stats for all jobs on this node.
 sub local_stats {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: local_stats().\n";
+    }
+#endif
+
     my @files = slurp_dir('/proc/rms/programs');
 
     foreach my $job (@files) {
@@ -2352,6 +2427,12 @@ sub local_stats {
 #	RETURN		1 if match, 0 if not
 #
 sub cmp_list {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: cmp_list(@_).\n";
+    }
+#endif
+
     my ( $l1, $l2 ) = @_;
 
     if ( $#{$l1} != $#{$l2} ) {
@@ -2546,7 +2627,7 @@ sub slurm_is_installed {
 
 sub slurm_get_jobs {
     my $user = shift;
-    my @res  = slurp_cmd("squeue -a -t running -u $user -h -o %i");
+    my @res  = slurp_cmd("squeue -t running -u $user -h -o %i");
     chomp @res;
     return @res;
 }
@@ -2556,7 +2637,7 @@ sub slurm_get_jobs {
 sub slurm_job_to_ncpus {
     my $job   = shift;
     my $s     = "$job." . $conf{slurm_job_step};
-    my @steps = slurp_cmd("squeue -a -s $s -o %i,%A");
+    my @steps = slurp_cmd("squeue -s $s -o %i,%A");
 
     # The %A option is new so ensure we have the TASKS output before we
     # believe what we see here...  Mind you %A is several years old now so
@@ -2576,7 +2657,7 @@ sub slurm_job_to_ncpus {
 # Query the nodecount for the "job" as that is what we shall be running on.
 sub slurm_job_to_nodecount {
     my $job  = shift;
-    my @jobs = slurp_cmd('squeue -a -o %i,%D');
+    my @jobs = slurp_cmd('squeue -o %i,%D');
 
     chomp @jobs;
     foreach my $step (@jobs) {
@@ -2592,7 +2673,7 @@ sub slurm_job_to_nodecount {
 sub slurm_job_to_nodelist {
     my $job   = shift;
     my $s     = "$job." . $conf{slurm_job_step};
-    my @steps = slurp_cmd("squeue -a -s $s -o %i,%N");
+    my @steps = slurp_cmd("squeue -s $s -o %i,%N");
 
     chomp @steps;
     foreach my $step (@steps) {
@@ -2604,7 +2685,7 @@ sub slurm_job_to_nodelist {
 
 sub slurm_job_is_running {
     my $job    = shift;
-    my @s      = slurp_cmd("squeue -a -h -j $job -o %T");
+    my @s      = slurp_cmd("squeue -h -j $job -o %T");
     my $status = lc $s[0];
     chomp $status;
     return ( $status eq 'running' );
@@ -2618,7 +2699,7 @@ sub slurm_setup_job {
     # step ids slurm thinks are running and pick the first one.
     # Previously this value just defaulted to zero.
     if ( not defined $conf{slurm_job_step} ) {
-        my @all_steps = slurp_cmd("squeue -a -s -o %i");
+        my @all_steps = slurp_cmd("squeue -s -o %i");
         my @valid_steps;
         foreach my $step (@all_steps) {
             chomp $step;
@@ -2655,13 +2736,22 @@ sub slurm_setup_job {
 
 sub local_get_jobs {
     my $user = shift;
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: local_get_jobs($user).\n";
+    }
+#endif
     return get_process_list($user);
 }
 
 sub local_fd_get_jobs_real {
     my $user = shift;
     my $file = shift;
-
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: local_fd_get_jobs_real($user $file).\n";
+    }
+#endif
     my @pids = get_process_list($user);
 
     my @jobs;
@@ -2683,6 +2773,11 @@ sub local_fd_get_jobs_real {
 
 sub local_fd_get_jobs {
     my $user = shift;
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: local_fd_get_jobs($user).\n";
+    }
+#endif
     return local_fd_get_jobs_real( $user, $conf{local_fd_name} );
 }
 
@@ -2692,17 +2787,31 @@ sub local_q_is_installed {
 
 sub local_q_get_jobs {
     my $user = shift;
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: local_q_get_jobs($user).\n";
+    }
+#endif
     return local_fd_get_jobs_real( $user, '/proc/qsnet/elan/user' );
 }
 
 sub local_job_is_running {
     my $job = shift;
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: local_job_is_running($job).\n";
+    }
+#endif
     return ( -d "/proc/$job" );
 }
 
 sub local_setup_job {
     my $job = shift;
-
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: local_setup_job($job).\n";
+    }
+#endif
     my $hostname = hostname();
     my %pcmd;
     $pcmd{nprocesses}                 = 1;
@@ -2812,14 +2921,31 @@ sub unlink_file {
 my %pbs_tabjobs;
 
 sub pbs_is_installed {
-    return find_exe('qstat');
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: pbs_is_installed().\n";
+    }
+#end Jie's tracing
+    my $ret = find_exe('qstat');
+
+    if ( $ret == 1) {
+	$pbs_in_use = 1;   
+    }
+
+    if (defined $padb_debug) {
+	    print "ret from find_exe('qstat') is $ret, pbs_in_use is $pbs_in_use.\n";
+    }
+
+    return $ret;
 }
 
+# replace pbs_get_lqsub from padb-3.3
 # Load a list of jobs from a given server, saving the server and the host list
 # for each one.
 sub pbs_get_lqsub {
     my ( $user, $server ) = @_;
-    my $cmd = "qstat -n -u $user \@$server";
+    #my $cmd = "qstat -n -1 -u $user \@$server";
+    my $cmd = "qstat -n -1 -u $user";
 
     my $job = undef;
 
@@ -2831,24 +2957,24 @@ sub pbs_get_lqsub {
 # " xn8/0*2+xn9/0*2+xn10/0*2"
 # all we care about from this is the hostname (xn[8-10]) so split on '+' and then
 # strip everything after the first '/'
-        if ( defined $job ) {
+    #    if ( defined $job ) {
 
-            $line =~ s/^ +//;    # suppress blank in front of line
-            $line =~ s/^\+//;    # suppress first + sign
-            my @champs = split( /\+/, $line );    # split by '+'
-            foreach my $word (@champs) {
-                my ($host) = split "/", $word;
-                push( @{ $pbs_tabjobs{$job}{hosts} }, $host );
-            }
-            $job = undef;
-            next;
-        }
+    #        $line =~ s/^ +//;    # suppress blank in front of line
+    #        $line =~ s/^\+//;    # suppress first + sign
+    #        my @champs = split( /\+/, $line );    # split by '+'
+    #        foreach my $word (@champs) {
+    #            my ($host) = split "/", $word;
+    #            push( @{ $pbs_tabjobs{$job}{hosts} }, $host );
+    #        }
+    #        $job = undef;
+    #        next;
+    #   }
 
 # See if this line of output matches a job id, it has to be of the correct user and running.
 # If this is a running job set $job to it's identifier so the code above can match the hostlist
 # which will be on the next line of output.
         my @parts = split $SPACE, $line;
-        if ( $#parts == 10 and $parts[1] eq $user and $parts[9] eq 'R' ) {
+        if ( $#parts == 11 and $parts[1] eq $user and $parts[9] eq 'R' ) {
             my ( $job_id, $job_server ) = split $PERIOD, $parts[0];
 
             if ( defined $pbs_tabjobs{$job_id}{server} ) {
@@ -2856,7 +2982,6 @@ sub pbs_get_lqsub {
                 next;
             }
             $job = $job_id;
-
 # This test is perfectly "safe" and should never fail apart from the case where the job id
 # and the server name don't fit inside the 15 characters allowed.  This can be worked around
 # by setting the -w flag which tells pbs_pro to print up to 30 characters but that doesn't
@@ -2866,13 +2991,133 @@ sub pbs_get_lqsub {
             }
             $pbs_tabjobs{$job_id}{nproc}  = $parts[6];
             $pbs_tabjobs{$job_id}{server} = $server;
+			#print "pbs_tabjobs.nproc=", $pbs_tabjobs{$job_id}{nproc}, "\n";
+			#print "pbs_tabjobs.server=", $pbs_tabjobs{$job_id}{server}, "\n";
+			
+			my @champs = split( /\+/, $parts[11] );    # split by '+'
+            foreach my $word (@champs) {
+                my ($host) = split "/", $word;
+				#print "host=", $host, "\n";
+                push( @{ $pbs_tabjobs{$job}{hosts} }, $host );
+				#print "job=$job\n";
+            }
+            $job = undef;
+            next;
         }
     }
     return;
 }
 
+## Load a list of jobs from a given server, saving the server and the host list
+## for each one.
+#sub pbs_get_lqsub {
+#
+##Jie's Tracing
+#    if (defined $padb_trace) {
+#	print "padb_trace: pbs_get_lqsub(@_).\n";
+#    }
+##endif
+#
+#    my ( $user, $server ) = @_;
+## original .. 
+##    my $cmd = "qstat -n -u $user \@$server";
+## Jie's hack for anupbs
+#    my $cmd = "qstat -w -n -u $user \@$server";
+##end of Jie's hack
+#
+#    my $job = undef;
+##Jie's hack
+#    my $prev_host = undef;
+##end Jie's hack
+#    my @output = slurp_cmd($cmd);
+#    if (defined $padb_debug) {
+#	print "$output[0] $output[1] $output[2] $output[3] $output[4] $output[5] $output[6]";
+#    }
+#    foreach my $line (@output) {
+#        print "line:", $line;
+## If we have previously matched a job (see below) then extract the hostlist.
+## This line of outputs has the form:
+## " xn8/0*2+xn9/0*2+xn10/0*2"
+## all we care about from this is the hostname (xn[8-10]) so split on '+' and then
+## strip everything after the first '/'
+#        if ( defined $job ) {
+#
+#            $line =~ s/^ +//;    # suppress blank in front of line
+#            $line =~ s/^\+//;    # suppress first + sign
+#            my @champs = split( /\+/, $line );    # split by '+'
+#	    if (defined $padb_debug) {
+#		print "$champs[0] $champs[1] $champs[2].\n";
+#	    }
+#	    
+#            foreach my $word (@champs) {
+#                my ($host) = split "/", $word;
+##original
+##                push( @{ $pbs_tabjobs{$job}{hosts} }, $host );
+## Jie's hack for anupbs to get uniq host name
+#		if ( defined $prev_host) {
+#		    if ( $host ne $prev_host ) {
+#			push( @{ $pbs_tabjobs{$job}{hosts} }, $host );
+#			$prev_host = $host;
+#			if (defined $padb_debug) {
+#			    print "$host.\n";
+#			}			
+#		    }
+#		} else {
+#		    push( @{ $pbs_tabjobs{$job}{hosts} }, $host );
+#		    $prev_host = $host;
+#		    if (defined $padb_debug) {
+#			print "$host.\n";
+#		    }		    
+#		}
+##end of Jie's hack
+#            }
+#            $job = undef;
+#            next;
+#        }
+#
+## See if this line of output matches a job id, it has to be of the correct user and running.
+## If this is a running job set $job to it's identifier so the code above can match the hostlist
+## which will be on the next line of output.
+#        my @parts = split $SPACE, $line;
+##original
+##        if ( $#parts == 10 and $parts[1] eq $user and $parts[9] eq 'R' ) {
+##Jie's hack for anupbs..
+#        if ( $#parts == 9 and $parts[1] eq $user and $parts[8] eq 'R' ) {
+##end of Jie's hack
+#            my ( $job_id, $job_server ) = split $PERIOD, $parts[0];
+#
+#            if ( defined $pbs_tabjobs{$job_id}{server} ) {
+#                printf("Warning, job $job_id exists on multiple servers\n");
+#                next;
+#            }
+#            $job = $job_id;
+#
+## This test is perfectly "safe" and should never fail apart from the case where the job id
+## and the server name don't fit inside the 15 characters allowed.  This can be worked around
+## by setting the -w flag which tells pbs_pro to print up to 30 characters but that doesn't
+## work on Torque or plain pbs so only check this value if the string is shorter than that.
+#            if ( length $parts[0] < 15 and $job_server ne $server ) {
+#                printf("Warning, job is listed with unexpected server\n");
+#            }
+##original
+##            $pbs_tabjobs{$job_id}{nproc}  = $parts[6];
+##Jie's hack for anupbs
+#            $pbs_tabjobs{$job_id}{nproc}  = $parts[5];
+##end of Jie's hack
+#            $pbs_tabjobs{$job_id}{server} = $server;
+#        }
+#    }
+#    return;
+#}
+
 sub pbs_get_data {
     my $user = shift;
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: pbs_get_data($user).\n";
+    }
+#endif
+
     return \%pbs_tabjobs if ( keys %pbs_tabjobs != 0 );
 
     my @servers;
@@ -2906,18 +3151,41 @@ sub pbs_get_data {
 
 sub pbs_get_jobs {
     my $user = shift;
-
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: pbs_get_jobs($user).\n";
+    }
+#endif
     my $d = pbs_get_data($user);
 
     my @jobs = keys %{$d};
+
+    while ( (my $k,my $v) = each %{$d}) {
+        push(@jobs,$k.".".%{$v}{server});
+    }
+
     return @jobs;
 }
 
 sub pbs_setup_job {
     my $job = shift;
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: pbs_setup_job($job).\n";
+    }
+#endif
     my $d   = pbs_get_data($target_user);
 
-    my @hosts = @{ $d->{$job}{hosts} };
+#dsr900 $job might be 12345678 or 12345678.server - deal with that here
+    my @hosts;
+    eval {
+        @hosts = @{ $d->{$job}{hosts} };
+        1;
+    } or do {
+        my @j = split $PERIOD, $job;
+        $job = $j[0];
+        @hosts = @{ $d->{$job}{hosts} };
+    };
 
     config_set_internal( 'pbs_server', $d->{$job}{server} );
 
@@ -3273,6 +3541,11 @@ sub get_pids_fromport {
 ###############################################################################
 
 sub find_ompi_prefix {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: find_ompi_prefix().\n";
+    }
+#endif
     foreach my $dir ( split $COLON, $ENV{PATH} ) {
         next unless ( -x "$dir/ompi-ps" );
         my @d = split "/", $dir;
@@ -3284,12 +3557,22 @@ sub find_ompi_prefix {
 }
 
 sub open_is_installed {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: open_is_installed().\n";
+    }
+#endif
     return ( find_exe('ompi-ps') and find_exe('orterun') );
 }
 
 my %open_jobs;
 
 sub open_get_data {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: open_get_data().\n";
+    }
+#endif
 
     # Simply return if called more than once.
     if ( keys %open_jobs != 0 ) {
@@ -3304,36 +3587,26 @@ sub open_get_data {
         next if ( $l eq $EMPTY_STRING );
 
         my @elems = split qr{\s*\|\s*}, $l;
-        next unless @elems >= 4;
 
-# We used to check for the number of elements here and then match the jobid seperatly but that doesn't
-# work for all cases as sometimes Open-Mpi has extra checkpoint-restart related data on the end
-# of each line changing the element count and hence the test to fail.  Now we check the element count
-# is at least as long as we expect, we check that all fields that should be integers are actually integers
-# and I've moved the regexp for matching the job ID into the line test.
-# For performance reasons I've put the per-rank test before the per-job test as it triggers more often.
-        if (    @elems >= 6
-            and ( $elems[1] =~ m{\A\[\[(\d+)\,(\d+)\]\,(\d+)\]}x )
-            and is_digit( $elems[2] )
-            and is_digit( $elems[3] ) )
-        {
-            my $job  = $1;
-            my $step = $2;
-            my $rank = $3;
-            my $pid  = $elems[3];
-            my $host = $elems[4];
-            $open_jobs{$job}{$step}{hosts}{$host}++;
-            $open_jobs{$job}{$step}{ranks}{$host}{$rank} = $pid;
-
-        } elsif ( @elems >= 4
-            and ( $elems[0] =~ m{\A\[(\d+)\,(\d+)]\z}x )
-            and is_digit( $elems[2] )
-            and is_digit( $elems[3] ) )
-        {
+        if ( @elems == 4 ) {
             my $nprocs = $elems[3];
-            my $job    = $1;
-            my $step   = $2;
-            $open_jobs{$job}{$step}{nprocs} = $nprocs;
+            my $name   = $elems[0];
+            if ( $name =~ m{\A\[(\d+)\,(\d+)]\z}x ) {
+                my $job  = $1;
+                my $step = $2;
+                $open_jobs{$job}{$step}{nprocs} = $nprocs;
+            }
+        } elsif ( @elems == 6 ) {
+            my $name = $elems[1];
+            if ( $name =~ m{\A\[\[(\d+)\,(\d+)\]\,(\d+)\]}x ) {
+                my $job  = $1;
+                my $step = $2;
+                my $rank = $3;
+                my $pid  = $elems[3];
+                my $host = $elems[4];
+                $open_jobs{$job}{$step}{hosts}{$host}++;
+                $open_jobs{$job}{$step}{ranks}{$host}{$rank} = $pid;
+            }
         }
     }
     return;
@@ -3341,14 +3614,22 @@ sub open_get_data {
 
 sub open_get_jobs {
     my $user = shift;
-
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: open_get_jobs($user).\n";
+    }
+#end Jie's tracing
     open_get_data();
     return keys %open_jobs;
 }
 
 sub open_setup_job {
     my $job = shift;
-
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: open_setup_job($job).\n";
+    }
+#endif
     open_get_data();
 
     my $step = $conf{orte_job_step};
@@ -3463,7 +3744,11 @@ sub lsf_setup_pcmd {
 
 sub mpirun_get_jobs {
     my $user = shift;
-
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: mpirun_get_jobs($user).\n";
+    }
+#endif
     my @jobs;
 
     my %mpirun;
@@ -3497,6 +3782,11 @@ sub mpirun_get_jobs {
 
 sub mpirun_setup_job {
     my ($job) = @_;
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: mpirun_setup_job($job).\n";
+    }
+#endif
 
     my $gdb = gdb_start();
     if ( not gdb_attach( $gdb, $job ) ) {
@@ -3518,7 +3808,7 @@ sub mpirun_setup_job {
 
     # Whilst it's possible to dip inside the struct in the process to
     # extract this information some builds don't associate a type with
-    # MPIR_proctable which means in those cases this method won't work.
+    # MPIR_proctable which means in those cases this methhod won't work.
     # Instead use a set of hardcoded values for offset and size as defined
     # by the interface and do the maths for finding each element ourselves.
 
@@ -3619,7 +3909,11 @@ sub mpirun_setup_job {
 
 sub setup_rmgr {
     $conf{rmgr} = shift;
-
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: setup_rmgr($conf{rmgr}).\n";
+    }
+#endif
     # Now setup the variable for the rest of the program.
     if ( defined $rmgr{ $conf{rmgr} }{inner_rmgr} ) {
         $cinner{rmgr} = $rmgr{ $conf{rmgr} }{inner_rmgr};
@@ -3630,6 +3924,11 @@ sub setup_rmgr {
 }
 
 sub find_rmgr {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: find_rmgr().\n";
+    }
+#endif
 
     # If it's been set on the command line and it's valid then just use
     # what we are given.  Do sanity checks here but only warn on the result
@@ -3677,6 +3976,11 @@ sub find_rmgr {
 # zero or many exit with an error.
 sub find_any_rmgr {
     my ($user) = @_;
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: find_any_rmgr(@_).\n";
+    }
+#endif
 
     # If it's been set on the command line and it's valid then just use
     # what we are given.  Do sanity checks here but only warn on the result
@@ -3749,17 +4053,28 @@ sub find_any_rmgr {
 
 sub get_all_jobids {
     my $user = shift;
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: get_all_jobids($user).\n";
+    }
+#endif
+
     debug_log( 'rmgr', undef, 'Loading active jobs list' );
     return $rmgr{ $conf{rmgr} }{get_active_jobs}($user);
 }
 
 sub job_is_running {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: job_is_running(@_).\n";
+    }
+#endif
+
     my ( $job, $user ) = @_;
 
     if ( defined $rmgr{ $conf{rmgr} }{job_is_running} ) {
         return $rmgr{ $conf{rmgr} }{job_is_running}($job);
     }
-
     my @jobs = $rmgr{ $conf{rmgr} }{get_active_jobs}($user);
     my %j;
     map { $j{$_} = 1; } @jobs;
@@ -3768,7 +4083,11 @@ sub job_is_running {
 
 sub job_to_key {
     my $job = shift;
-
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: job_to_key($job).\n";
+    }
+#endif
     if ( defined $rmgr{ $conf{rmgr} }{job_to_key} ) {
         return $rmgr{ $conf{rmgr} }{job_to_key}($job);
     }
@@ -3778,6 +4097,11 @@ sub job_to_key {
 
 sub setup_job {
     my $job = shift;
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: setup_job($job).\n";
+    }
+#endif
 
     # If the resource manager provides a setup_pcmd function then use it and
     # simply convert the list it provides into a hash before returning it.
@@ -3811,7 +4135,7 @@ sub setup_job {
     if ( not defined $pcmd{host_list} ) {
         $mode_list = 'rmgr';
     }
-
+ 
     my @modes = split $COMMA, $mode_list;
 
     my @hosts;
@@ -3819,7 +4143,7 @@ sub setup_job {
         @hosts = @{ $pcmd{host_list} };
     }
 
-    my $have_pdsh  = find_exe('pdsh');
+    my $have_pdsh = find_exe('pdsh');
     my $have_clush = find_exe('clush');
 
     foreach my $mode (@modes) {
@@ -3843,37 +4167,40 @@ sub setup_job {
             next unless ($have_pdsh);
             next if ( @hosts == 0 );
 
-            my $fanout = @hosts + 5;
-
             $pcmd{require_inner_callback} = 1;
             my $hlist = join q{,}, @hosts;
-            $pcmd{command} = "pdsh -f $fanout -w $hlist";
+            $pcmd{command} = "pdsh -w $hlist";
+	    
+            if ( @hosts > 20 ) {
+                my $fanout = @hosts + 5;
+                $ENV{FANOUT} = $fanout;
 
-            if ( @hosts > 128 ) {
-                print "Pdsh backend not recommended for such large jobs\n";
+                if ( @hosts > 128 ) {
+                    print "Pdsh backend not recommended for such large jobs\n";
+                }
             }
 
             return %pcmd;
-
-        } elsif ( $mode eq 'clush' ) {
+	} elsif ( $mode eq 'clush' ) {
             next unless ($have_clush);
             next if ( @hosts == 0 );
 
-            my $fanout = @hosts + 5;
-
             $pcmd{require_inner_callback} = 1;
             my $hlist = join q{,}, @hosts;
-            $pcmd{command} = "clush -f $fanout --nostdin -w $hlist";
+            $pcmd{command} = "clush -w $hlist";
+	    
+            if ( @hosts > 20 ) {
+                my $fanout = @hosts + 5;
+                $pcmd{command} = $pcmd{command} . ' -f ' . $fanout;
+            }
 
-            return %pcmd;
-
+            return %pcmd;	    
         } else {
             print "Backend invalid: $mode\n";
         }
     }
 
-    print
-      "No suitable backend found (perhaps try installing pdsh or clush ?)!\n";
+    print "No suitable backend found (perhaps try installing pdsh?)!\n";
     return;
 
 }
@@ -3887,6 +4214,12 @@ sub setup_job {
 # This function isn't called but I've kept it for now in case it becomes
 # needed when dealing with files.
 sub strip_stack_traces {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: strip_stack_traces(@_).\n";
+    }
+#endif
+
     my ( $cargs, $lines ) = @_;
 
     my %above;
@@ -3934,6 +4267,11 @@ sub strip_stack_traces {
 }
 
 sub sort_proc_hashes {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: sort_proc_hashes(@_).\n";
+    }
+#endif
     my $carg = shift;
     my $key  = shift;
     my @all  = (@_);
@@ -3964,6 +4302,11 @@ sub sort_proc_hashes {
 }
 
 sub pre_mpi_watch {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: pre_mpi_watch(@_).\n";
+    }
+#endif
     my ($nprocs) = @_;
     my $header = <<'EOF';
 u: unexpected messages U: unexpected and other messages
@@ -3993,6 +4336,11 @@ EOF
 # of ranks containing the values.  Assume that each rank only appears in
 # the namespace with one value.
 sub array_from_target_namespace {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: array_from_target_namespace(@_).\n";
+    }
+#endif
     my ($r) = @_;
 
     my @all;
@@ -4005,6 +4353,11 @@ sub array_from_target_namespace {
 }
 
 sub tree_from_namespace {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: tree_from_namespace(@_).\n";
+    }
+#endif
     my ($r) = @_;
 
     my %res;
@@ -4023,6 +4376,11 @@ sub tree_from_namespace {
 }
 
 sub show_mpi_watch {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: show_mpi_watch(@_).\n";
+    }
+#endif
     my ( $handle, $lines ) = @_;
 
     my @all = array_from_target_namespace( $lines->{target_data}{state} );
@@ -4040,6 +4398,11 @@ sub show_mpi_watch {
 # wanted and only ask the nodes to report relevant info, for now they still
 # report everything.
 sub show_proc_format {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: show_proc_format(@_).\n";
+    }
+#endif
     my ( $carg, $nlines ) = @_;
 
     my @proc_format_array;
@@ -4133,6 +4496,11 @@ sub show_proc_format {
 }
 
 sub show_results_from_file {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: show_results_from_file(@_).\n";
+    }
+#endif
     my ( $nlines, $mode ) = @_;
 
     my $lines = $nlines->{lines};
@@ -4167,6 +4535,11 @@ sub show_results_from_file {
 ###############################################################################
 
 sub process_line {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: process_line(@_).\n";
+    }
+#endif
     my ( $line, $lines ) = @_;
 
     if ( $line =~ m{\A(\d+):(.*)\n}x ) {
@@ -4180,19 +4553,17 @@ sub process_line {
 }
 
 sub default_output_handler {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: default_output_handler(@_).\n";
+    }
+#endif
     my ( $req, $d ) = @_;
 
     my $cargs = $req->{cargs};
 
-    # Warn on missing output here, be sure to check both standard output and
-    # namespace output because if we are using a tree then there won't be any
-    # standard output.
-    if ( not exists $d->{target_output} and not exists $d->{target_ns_output} )
-    {
-        return;
-    }
-
-    #return unless exists $d->{target_output};
+    # Warn on missing output here...
+    return unless exists $d->{target_output};
 
     my $lines = $d->{target_output};
     my $mode  = $req->{mode};
@@ -4216,6 +4587,11 @@ sub default_output_handler {
 }
 
 sub add_tag_to_tree {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: add_tag_to_tree(@_).\n";
+    }
+#endif
     my ( $tree, $tag, $output ) = @_;
 
     my $line = shift @{$output};
@@ -4242,6 +4618,11 @@ sub add_tag_to_tree {
 # {type_name} which is the same length as {type_name} for all other entries
 # in the array.
 sub _format_local_vars {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: _format_local_vars(@_).\n";
+    }
+#endif
     my ($list) = @_;
 
     my $max = 0;
@@ -4274,11 +4655,21 @@ sub _format_local_vars {
 # --format-for-html option would be the way to go in future.
 sub pretify_variable {
     my $var = shift;
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: pretify_variable($var).\n";
+    }
+#endif
     return $var;
 }
 
 sub _add_data_to_point_on_tree {
     my ( $tree, $d, $l, $max_show, $peer, @vars ) = @_;
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: _add_data_to_point_on_tree(@_).\n";
+    }
+#endif
 
     my @all_vars;
     foreach my $var (@vars) {
@@ -4299,10 +4690,8 @@ sub _add_data_to_point_on_tree {
         my @values = keys %{ $d->{target_data}{$key} };
 
         if ( @values == 1 ) {
-            my $line =
-              "  $vref->{type_name} = '$values[0]' "
-              . rng_convert_to_user_truncate(
-                $d->{target_data}{$key}{ $values[0] } );
+            my $line = "  $vref->{type_name} = '$values[0]' "
+              . rng_convert_to_user( $d->{target_data}{$key}{ $values[0] } );
             push @{ $tree->{$peer}->{aux} }, $line;
         } elsif ( @values > $max_show ) {
             my $line = "  $vref->{type_name}: "
@@ -4311,10 +4700,8 @@ sub _add_data_to_point_on_tree {
         } else {
             push @{ $tree->{$peer}->{aux} }, "  $vref->{type_name}:";
             foreach my $value ( sort @values ) {
-                my $line =
-                  "      '$value' "
-                  . rng_convert_to_user_truncate(
-                    $d->{target_data}{$key}{$value} );
+                my $line = "      '$value' "
+                  . rng_convert_to_user( $d->{target_data}{$key}{$value} );
                 push @{ $tree->{$peer}->{aux} }, $line;
 
             }
@@ -4325,6 +4712,11 @@ sub _add_data_to_point_on_tree {
 
 sub _add_data_to_tree {
     my ( $tree, $d, $path ) = @_;
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: _add_data_to_tree(@_).\n";
+    }
+#endif
 
     # Sort peers by lowest rank of each branch.
     my @peers =
@@ -4383,6 +4775,11 @@ sub _add_data_to_tree {
 }
 
 sub add_data_to_tree {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: add_data_to_tree(@_).\n";
+    }
+#endif
     my ( $tree, $ns, $d ) = @_;
     my $prefix = $EMPTY_STRING;
     if ( defined $ns ) {
@@ -4395,11 +4792,13 @@ sub add_data_to_tree {
 }
 
 sub _display_tree {
-    my ( $tree, $nproc, $parent, $indent_count, $path, $enforce_spec ) = @_;
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: _display_tree(@_).\n";
+    }
+#endif
+    my ( $tree, $parent, $indent, $path, $enforce_spec ) = @_;
 
-    my $indent = sprintf( "%3d:%*s",
-        $indent_count + 1,
-        $indent_count * $conf{tree_indent}, '' );
     my $ret = $EMPTY_STRING;
 
     # Sort peers by lowest rank of each branch.
@@ -4407,57 +4806,51 @@ sub _display_tree {
       sort { $tree->{$a}->{min} <=> $tree->{$b}->{min} } keys %{$tree};
 
     my $child_enforce_spec = 0;
-    my $branch_index       = 1;
     foreach my $peer (@peers) {
 
-        my $vpspec = rng_convert_to_user_truncate( $tree->{$peer}->{range} );
+        my $vpspec = rng_convert_to_user( $tree->{$peer}->{range} );
         if ( @peers != 1 or $parent ne $vpspec or $enforce_spec ) {
-            $ret .= "$indent -----------------\n";
-            my $count = $tree->{$peer}->{count};
-
-            $ret .= sprintf(
-                "$indent Branch %d of %d, $count %s, %.3g%% of total $vpspec\n",
-                $branch_index,
-                $#peers + 1,
-                $count > 1 ? 'processes' : 'process',
-                ( $count / $nproc ) * 100
-            );
-
-            $ret .= "$indent -----------------\n";
+            $ret .= "$indent-----------------\n";
+            $ret .= "$indent$vpspec ($tree->{$peer}->{count} processes)\n";
+            $ret .= "$indent-----------------\n";
         }
 
-        $ret .= "$indent $peer\n";
+        $ret .= "$indent$peer\n";
 
         if ( defined $tree->{$peer}->{aux} ) {
             $child_enforce_spec = 1;
             foreach my $line ( @{ $tree->{$peer}->{aux} } ) {
-                $ret .= "$indent       $line\n";
+                $ret .= "$indent      $line\n";
             }
         }
 
         if ( defined $tree->{$peer}->{desc} ) {
-            $ret .= _display_tree(
-                $tree->{$peer}->{desc},
-                $nproc, $vpspec, $indent_count + 1,
-                "$path,$peer", $child_enforce_spec
-            );
+            $ret .= _display_tree( $tree->{$peer}->{desc},
+                $vpspec, "$indent  ", "$path,$peer", $child_enforce_spec );
         }
-        $branch_index += 1;
     }
     return $ret;
 }
 
 sub display_tree {
-    my ( $tree, $nproc ) = @_;
-    return _display_tree( $tree, $nproc, "no-parent", 0, $EMPTY_STRING, 1 );
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: display_tree(@_).\n";
+    }
+#endif
+    my ( $tree, ) = @_;
+    return _display_tree( $tree, "no-parent", $EMPTY_STRING, $EMPTY_STRING, 1 );
 }
 
 # An experimental new tree format.
 sub new_tree {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: new_tree(@_).\n";
+    }
+#endif
     my ( $lines, $d ) = @_;
     my %tree;
-
-    my $nprocesses = keys %{$lines};
     debug_log( 'tree', $d, 'Making the tree' );
     foreach my $tag ( sort { $a <=> $b } keys %{$lines} ) {
         add_tag_to_tree( \%tree, $tag, $lines->{$tag} );
@@ -4465,7 +4858,7 @@ sub new_tree {
     debug_log( 'tree', \%tree, 'Enhancing the tree' );
     add_data_to_tree( \%tree, undef, $d );
     debug_log( 'tree', \%tree, 'Formatting the tree' );
-    my $t = display_tree( \%tree, $nprocesses );
+    my $t = display_tree( \%tree, );
     debug_log( 'tree', undef, 'Displaying the tree' );
     print $t;
     debug_log( 'tree', undef, 'Done' );
@@ -4474,10 +4867,14 @@ sub new_tree {
 
 # An experimental new tree format.
 sub new_ns_tree {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: new_ns_tree(@_).\n";
+    }
+#endif
     my ( $d, $ns ) = @_;
 
     my %tree;
-    my $nprocesses = keys %{ $d->{target_ns_output} };
     debug_log( 'tree', undef, 'Making the tree' );
     my @tags;
     foreach my $tag ( keys %{ $d->{target_ns_output} } ) {
@@ -4491,7 +4888,7 @@ sub new_ns_tree {
     debug_log( 'tree', \%tree, 'Enhancing the tree' );
     add_data_to_tree( \%tree, $ns, $d );
     debug_log( 'tree', \%tree, 'Formatting the tree' );
-    my $t = display_tree( \%tree, $nprocesses );
+    my $t = display_tree( \%tree, );
     debug_log( 'tree', undef, 'Displaying the tree' );
     print "Stack trace(s) for thread: $ns\n";
     print $t;
@@ -4500,6 +4897,11 @@ sub new_ns_tree {
 }
 
 sub complex_output_handler {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: complex_output_handler(@_).\n";
+    }
+#endif
     my ( $output, $lines, $d ) = @_;
 
     if ( $output eq 'tree' ) {
@@ -4552,6 +4954,11 @@ sub complex_output_handler {
 sub load_and_display_from_file {
     my $file = shift;
     my $mode = shift;
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: load_and_display_from_file($file $mode).\n";
+    }
+#endif
 
     #if ( $stats_total or $group ) {
     #    my @data;
@@ -4581,6 +4988,11 @@ sub load_and_display_from_file {
 
 sub rc_status {
     my $status = shift;
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: rc_status($status).\n";
+    }
+#endif
     my %rc;
 
     $rc{rc}     = $status >> 8;
@@ -4591,6 +5003,11 @@ sub rc_status {
 }
 
 sub maybe_clear_screen {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: maybe_clear_screen().\n";
+    }
+#endif
     return unless $watch;
     if ( $conf{watch_clears_screen} ) {
         printf "%s", " \033[1;1H";
@@ -4600,6 +5017,11 @@ sub maybe_clear_screen {
 }
 
 sub connect_to_child {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: connect_to_child(@_).\n";
+    }
+#endif
     my ( $host, $port, $word ) = @_;
 
     my $socket = IO::Socket::INET->new(
@@ -4614,15 +5036,30 @@ sub connect_to_child {
 }
 
 sub my_encode {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: my_encode(@_).\n";
+    }
+#endif
     return encode_base64( nfreeze(shift), $EMPTY_STRING );
 }
 
 sub my_decode {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: my_decode(@_).\n";
+    }
+#endif
     return thaw( decode_base64(shift) );
 }
 
 # We have read data on a socket, process it and call any callback.
 sub extract_line {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: extract_line(@_).\n";
+    }
+#endif
     my ( $handle, $sd ) = @_;
 
     my $str = $sd->{str};
@@ -4668,6 +5105,11 @@ sub extract_line {
 # accept children next iteration) and loop until there are no more hosts
 # left to add.
 sub generate_binary_tree {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: generate_binary_tree(@_).\n";
+    }
+#endif
     my ( $a, $width ) = @_;
     my @b = @{$a};
     my %comm_tree;
@@ -4700,6 +5142,11 @@ sub generate_binary_tree {
 # a number of children.  Currently just make this a simple "ladder" but
 # should probably be a f-nomial tree.
 sub generate_comm_tree {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: generate_comm_tree(@_).\n";
+    }
+#endif
     my ($a) = @_;
 
     return generate_binary_tree( $a, $conf{tree_width} );
@@ -4708,6 +5155,11 @@ sub generate_comm_tree {
 # Called once when we have the socket details of the last child.
 sub connect_to_children {
     my $comm_data = shift;
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: connect_to_children($comm_data).\n";
+    }
+#endif
 
     debug_log( 'signon', undef, 'Received last signon, connecting to inner' );
 
@@ -4738,6 +5190,11 @@ sub connect_to_children {
 }
 
 sub issue_command_to_inner {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: issue_command_to_inner(@_).\n";
+    }
+#endif
     my ( $cdata, $cmd ) = @_;
     my $str = my_encode($cmd);
     debug_log( 'full_duplex', $cmd, 'Sending command to inner, %d bytes',
@@ -4748,6 +5205,11 @@ sub issue_command_to_inner {
 
 sub first_command {
     my $comm_data = shift;
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: first_command($comm_data).\n";
+    }
+#endif
 
     my $req;
     $req->{mode}            = 'signon';
@@ -4772,6 +5234,11 @@ my @commands;
 
 # Push a command onto the list of commands to be executed.
 sub push_command {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: push_command(@_).\n";
+    }
+#endif
     my ( $mode, $out_format, $args ) = @_;
 
     my %cmd;
@@ -4783,6 +5250,11 @@ sub push_command {
 }
 
 sub last_command {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: last_command(@_).\n";
+    }
+#endif
     my $req;
     $req->{mode} = 'exit';
     return $req;
@@ -4790,6 +5262,11 @@ sub last_command {
 
 sub next_command {
     my $comm_data = shift;
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: next_command($comm_data).\n";
+    }
+#endif
 
     if ( @commands == 0 ) {
         return last_command();
@@ -4836,6 +5313,11 @@ sub next_command {
 }
 
 sub report_failed_signon {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: report_failed_signon(@_).\n";
+    }
+#endif
     my ( $key, $data ) = @_;
     my $length = length $key;
     print "$key : ranks\n";
@@ -4849,6 +5331,11 @@ sub report_failed_signon {
 # Check all processes are detected and report an error to the user.  Return
 # true if there is no processes are detected.
 sub check_signon {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: check_signon(@_).\n";
+    }
+#endif
     my ( $comm_data, $data ) = @_;
     return if ( $conf{check_signon} eq 'none' );
 
@@ -4895,6 +5382,11 @@ sub check_signon {
 my $header_shown = 0;
 
 sub maybe_show_header {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: maybe_show_header(@_).\n";
+    }
+#endif
     my ($comm_data) = @_;
     return if ($header_shown);
     my $mode = $comm_data->{current_req}{mode};
@@ -4907,6 +5399,11 @@ sub maybe_show_header {
 }
 
 sub format_target_data {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: format_target_data(@_).\n";
+    }
+#endif
     my ($td) = @_;
 
     my $ret = "\n";
@@ -4921,6 +5418,11 @@ sub format_target_data {
 }
 
 sub command_from_inner {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: command_from_inner(@_).\n";
+    }
+#endif
     my ( $comm_data, $cdata, $line ) = @_;
 
     # Initial signon from child.
@@ -5045,6 +5547,11 @@ sub command_from_inner {
 }
 
 sub handle_signon {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: handle_signon(@_).\n";
+    }
+#endif
     my ( $comm_data, $host, $port, $key ) = @_;
 
     $comm_data->{remote}{$host}{port} = $port;
@@ -5058,6 +5565,11 @@ sub handle_signon {
 }
 
 sub hello_from_inner {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: hello_from_inner(@_).\n";
+    }
+#endif
     my ( $comm_data, $cdata, $line ) = @_;
 
     # Children connect back with "Hello $outerkey $hostname $port $innernkey";
@@ -5080,6 +5592,11 @@ sub hello_from_inner {
 }
 
 sub inner_stdout_cb {
+#Jie's Tracing
+    if (defined $padb_trace && 0) {
+	    print "padb_trace: inner_stdout_cb(@_).\n";
+    }
+#endif
     my ( $comm_data, $cdata, $line ) = @_;
     my @words = split $SPACE, $line;
     if ( @words == 4 and $words[0] eq 'connect' ) {
@@ -5096,12 +5613,22 @@ sub inner_stdout_cb {
 }
 
 sub inner_stderr_cb {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: inner_stderr_cb(@_).\n";
+    }
+#endif
     my ( $comm_data, $cdata, $line ) = @_;
-    print "einner: $line\n";
+        print "einner: $line\n";
     return;
 }
 
 sub eof_from_fd {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: eof_from_fd(@_).\n";
+    }
+#endif
     my ( $comm_data, $cdata ) = @_;
 
     if ( $comm_data->{state} ne 'shutdown' ) {
@@ -5113,6 +5640,11 @@ sub eof_from_fd {
 }
 
 sub handle_event_from_socket {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: handle_event_from_socket(@_).\n";
+    }
+#endif
     my ( $comm_data, $h ) = @_;
     my $cdata = $comm_data->{sockets}{$h};
 
@@ -5133,6 +5665,11 @@ sub handle_event_from_socket {
 }
 
 sub handle_event_from_port {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: handle_event_from_port(@_).\n";
+    }
+#endif
     my ( $comm_data, $h ) = @_;
 
     my $new = $h->accept();
@@ -5195,6 +5732,11 @@ sub handle_event_from_port {
 
 # Convert from a user range to a internal one.
 sub rng_convert_from_user {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: rng_convert_from_user(@_).\n";
+    }
+#endif
     my ($range) = @_;
 
     return unless defined $range;
@@ -5213,7 +5755,7 @@ sub rng_convert_from_user {
 
     my @user_parts = split $COMMA, $newrange;
 
-    my $user_range = rng_create_empty();
+    my @parts;
 
     foreach my $part (@user_parts) {
         my %part;
@@ -5226,16 +5768,17 @@ sub rng_convert_from_user {
         } else {
             confess("Failed to recognise $part as range\n");
         }
-        my @parts;
         push @parts, \%part;
-        $user_range = rng_merge( $user_range, \@parts );
-
     }
-
-    return $user_range;
+    return \@parts;
 }
 
 sub rng_convert_to_user {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: rng_convert_to_user(@_).\n";
+    }
+#endif
     my ($rg) = @_;
 
     my $range = join q{,},
@@ -5243,20 +5786,12 @@ sub rng_convert_to_user {
     return "[$range]";
 }
 
-sub rng_convert_to_user_truncate {
-    my ($rg) = @_;
-
-    my $max_rankspec_length = $conf{rankspec_length};
-    my @spec =
-      map { $_->{l} == $_->{u} ? $_->{l} : $_->{l} . q{-} . $_->{u} } @{$rg};
-    if ( $max_rankspec_length > 0 and $#spec >= $max_rankspec_length ) {
-        return sprintf( "[%s...]",
-            join q{,}, @spec[ 0 .. $max_rankspec_length - 1 ] );
-    }
-    return sprintf( "[%s]", join q{,}, @spec );
-}
-
 sub rng_shift {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: rng_shift(@_).\n";
+    }
+#endif
     my ($rg) = @_;
 
     # Return undef if this range is empty.
@@ -5276,6 +5811,11 @@ sub rng_shift {
 # an array longer than it is to unshift something onto the start.  Quietly
 # return if the value is already in the range.
 sub rng_add_value {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: rng_add_value(@_).\n";
+    }
+#endif
     my ( $rg, $value ) = @_;
 
     if ( ref( $rg->[0] ) eq $EMPTY_STRING ) {
@@ -5340,67 +5880,37 @@ sub rng_add_value {
 }
 
 sub rng_merge {
-    my ( $left, $right ) = @_;
-
-    if ( not defined $left or rng_empty($left) ) {
-        return $right;
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: rng_merge(@_).\n";
     }
+#endif
+    my ( $rg, $new ) = @_;
 
-    my $combined = rng_create_empty();
-
-    while ( @{$left} != 0 and @{$right} != 0 ) {
-
-        my $elem;
-        if ( $left->[0]->{l} < $right->[0]->{l} ) {
-            $elem = shift @{$left};
-        } else {
-            $elem = shift @{$right};
-        }
-
-        if ( @{$combined} == 0 ) {
-            push @{$combined}, $elem;
-        } elsif ( $elem->{l} == $combined->[-1]->{u} + 1 ) {
-            $combined->[-1]->{u} = $elem->{u};
-        } elsif ( $elem->{l} >= $combined->[-1]->{l}
-            and $elem->{l} <= $combined->[-1]->{u} )
-        {
-            if ( $elem->{u} > $combined->[-1]->{u} ) {
-                $combined->[-1]->{u} = $elem->{u};
-            }
-        } else {
-            push @{$combined}, $elem;
-        }
+    # Need to use defined here as zero is a valid value to store in a
+    # range.
+    while ( defined( my $val = rng_shift($new) ) ) {
+        rng_add_value( $rg, $val );
     }
-
-    if ( @{$left} == 0 ) {
-        $left = $right;
-    }
-
-    if ( $left->[0]->{l} == $combined->[-1]->{u} + 1 ) {
-        my $elem = shift @{$left};
-        $combined->[-1]->{u} = $elem->{u};
-    } elsif ( $left->[0]->{l} >= $combined->[-1]->{l}
-        and $left->[0]->{l} <= $combined->[-1]->{u} )
-    {
-        my $elem = shift @{$left};
-        if ( $elem->{u} > $combined->[-1]->{u} ) {
-            $combined->[-1]->{u} = $elem->{u};
-        }
-    }
-
-    if ( @{$left} != 0 ) {
-        push @{$combined}, @{$left};
-    }
-
-    return $combined;
+    return;
 }
 
 sub rng_dup {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: rng_dup(@_).\n";
+    }
+#endif
     my ($rg) = @_;
     return dclone($rg);
 }
 
 sub rng_create_from_array {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: rng_create_from_array(@_).\n";
+    }
+#endif
     my (@r) = @_;
 
     my $rng = rng_create_empty();
@@ -5415,23 +5925,38 @@ sub rng_create_from_array {
 }
 
 sub rng_create_empty {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: rng_create_empty(@_).\n";
+    }
+#endif
     my @r;
     return \@r;
 }
 
 sub rng_empty {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: rng_empty(@_).\n";
+    }
+#endif
     my ($rg) = @_;
 
     return ( ref( $rg->[0] ) eq $EMPTY_STRING );
 }
 
 sub create_local_port {
-    my ( $range, $listen_count ) = @_;
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: create_local_port(@_).\n";
+    }
+#endif
+    my ($range) = @_;
 
     my %options = (
         Reuse  => 1,
         Proto  => 'tcp',
-        Listen => $listen_count,
+        Listen => 2,
     );
 
     if ( not defined $range ) {
@@ -5452,13 +5977,18 @@ sub create_local_port {
 }
 
 sub go_parallel {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: go_parallel(@_).\n";
+    }
+#endif
     my ( $jobid, $cmd, $nprocesses, $nhosts, $pd ) = @_;
 
     my $comm_data;
 
     my $sel = IO::Select->new();
     if ( $conf{inner_callback} ) {
-        my $sl = create_local_port( $conf{port_range}, $nhosts );
+        my $sl = create_local_port( $conf{port_range} );
 
         $comm_data->{listen} = $sl;
         my $port     = $sl->sockport();
@@ -5571,6 +6101,11 @@ sub go_parallel {
 }
 
 sub create_padb_secret {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: create_padb_secret(@_).\n";
+    }
+#endif
     my $filename = "$ENV{HOME}/.padb-secret";
     my $FD;
     if ( not open $FD, '>', $filename ) {
@@ -5589,6 +6124,11 @@ sub create_padb_secret {
 }
 
 sub find_padb_secret {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: find_padb_secret(@_).\n";
+    }
+#endif
 
     my $file = "$ENV{HOME}/.padb-secret";
     if ( !-f $file ) {
@@ -5625,6 +6165,11 @@ sub find_padb_secret {
 # Based on a patch from Thipadin Seng-Long @ Bull.
 
 sub padb_path {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: padb_path(@_).\n";
+    }
+#endif
     my $pwd   = $ENV{PWD};
     my $dirnm = dirname($0);
 
@@ -5645,6 +6190,11 @@ sub padb_path {
 
 sub go_job {
     my $jobid = shift;
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: go_job($jobid).\n";
+    }
+#endif
 
     $conf{verbose} && print "Attaching to job $jobid\n";
 
@@ -5676,6 +6226,20 @@ sub go_job {
 
     debug_log( 'verbose', undef, 'There are %d processes over %d hosts',
         $ncpus, $nhosts );
+
+    ### dsr900 - If we need to join a job namespace because we're a privileged user,
+    ### here is where we do it.
+    if ( defined( $conf{privileged_group} ) && defined( $conf{ns_join_app} ) ) {
+        my @gidlist = getgroups();
+        my $target_gid = getgrnam($conf{privileged_group});
+
+        foreach my $elem (@gidlist) {
+            if ( $elem == $target_gid) {
+                $cmd .= " $conf{ns_join_app} --";
+                last;
+            }
+        }
+    }
 
     $cmd .= " " . padb_path() . " --inner";
 
@@ -5713,17 +6277,32 @@ sub go_job {
 
 sub cmdline_error {
     my $str = shift;
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: cmdline_error($str).\n";
+    }
+#endif
     print {*STDERR} $str;
     exit 1;
 }
 
 sub config_init {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: config_init(@_).\n";
+    }
+#endif
     map { $ic_names{$_}++ } @inner_conf;
     map { $ic_names_cmd{$_}++ } @inner_conf_cmd;
     return;
 }
 
 sub config_set_internal {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: config_set_internal(@_).\n";
+    }
+#endif
     my ( $key, $value ) = @_;
     if ( exists $conf{$key} ) {
         $conf{$key} = $value;
@@ -5745,6 +6324,11 @@ sub config_set_internal {
 }
 
 sub config_set {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: config_set(@_).\n";
+    }
+#endif
     my ( $key, $value ) = @_;
     print "Setting '$key' to '$value'\n" if ( $conf{verbose} );
 
@@ -5761,7 +6345,11 @@ sub config_set {
 
 sub config_from_file {
     my $file = shift;
-
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: config_from_file($file).\n";
+    }
+#endif
     print "Loading config from \"$file\"\n" if ( $conf{verbose} );
 
     foreach my $line ( slurp_file($file) ) {
@@ -5786,6 +6374,11 @@ sub config_from_file {
 }
 
 sub config_from_env {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: config_from_env(@_).\n";
+    }
+#endif
     print "Loading config from environment\n" if ( $conf{verbose} );
 
     foreach my $key ( keys %conf ) {
@@ -5805,6 +6398,11 @@ sub config_from_env {
 }
 
 sub _config_help {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: _config_help(@_).\n";
+    }
+#endif
     my ($mode) = @_;
 
     print "\nOptions for mode '$allfns{$mode}{arg_long}'\n";
@@ -5821,7 +6419,8 @@ sub _config_help {
         my $name = $key;
         $name =~ s{_}{-}gx;
         if ( defined $conf{mode_options}{$mode}{$key} ) {
-            printf " %$max_len" . "s = '%s'\n",
+            printf
+              " %$max_len" . "s = '%s'\n",
               $name, $conf{mode_options}{$mode}{$key};
         } else {
             printf " %$max_len" . "s = undef\n", $name;
@@ -5831,6 +6430,11 @@ sub _config_help {
 }
 
 sub config_help {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: config_help(@_).\n";
+    }
+#endif
     my ($mode) = @_;
     print "Current options are:\n";
 
@@ -5865,6 +6469,11 @@ sub config_help {
 }
 
 sub outer_main {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: outer_main(@_).\n";
+    }
+#endif
 
     my $mode = parse_args_outer();
 
@@ -5900,10 +6509,7 @@ sub outer_main {
 
         $key =~ s{-}{_}gx;
 
-        if ( $key eq "help" ) {
-            config_help($mode);
-            exit(0);
-        } elsif ( not exists $conf{$key}
+        if (    not exists $conf{$key}
             and not exists $conf{mode_options_reverse}{$key} )
         {
             print "Error, unknown config option '$name'\n";
@@ -5963,7 +6569,12 @@ sub outer_main {
             print "$res: ";
             my @jobs = $rmgr{$res}{get_active_jobs}($user);
             if ( @jobs > 0 ) {
-                my $j = join q{ }, sort { $a <=> $b } @jobs;
+                my $j;
+                if ( $res eq "pbs" ) {
+                    $j = join q{ }, @jobs[$#jobs / 2 + 1 .. $#jobs];
+                } else {
+                    $j = join q{ }, sort { $a <=> $b } @jobs;
+                }
                 print "$j\n";
             } else {
                 print "No active jobs.\n";
@@ -6020,7 +6631,11 @@ sub outer_main {
     if ($show_jobs) {
         find_rmgr();
         my @jobids = get_all_jobids($user);
-        print "@jobids\n";
+        if ( $conf{rmgr} eq "pbs" ) {
+            print "@jobids[$#jobids / 2 + 1 .. $#jobids]\n"
+        } else {
+            print "@jobids\n";
+        }
         exit 0;
     }
 
@@ -6155,6 +6770,11 @@ my %inner_ns_output;
 my %local_target_data;
 
 sub output_namespace {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: output_namespace(@_).\n";
+    }
+#endif
     my ( $rank, $ns, $str ) = @_;
 
     push @{ $inner_ns_output{$rank}{$ns} }, $str;
@@ -6162,6 +6782,11 @@ sub output_namespace {
 }
 
 sub output {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: output(@_).\n";
+    }
+#endif
     my ( $vp, $str ) = @_;
 
     if ( not defined $str ) {
@@ -6174,6 +6799,11 @@ sub output {
 
 # Report a single string error for a given target rank.
 sub target_error {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: target_error(@_).\n";
+    }
+#endif
     my ( $rank, $error ) = @_;
     target_key_pair( $rank, 'ERROR', $error );
     return;
@@ -6183,6 +6813,11 @@ sub target_error {
 # now) this is called with UPPERCASE keys for control/padb values and
 # lowercase keys for mode values.
 sub target_key_pair {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: target_key_pair(@_).\n";
+    }
+#endif
     my ( $rank, $key, $value ) = @_;
 
     if ( defined $local_target_data{$key}{$value} ) {
@@ -6194,12 +6829,22 @@ sub target_key_pair {
 }
 
 sub p_die {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: p_die(@_).\n";
+    }
+#endif
     my ( $vp, $str ) = @_;
     croak($str);
 }
 
 sub is_parent_resmgr {
     my $pid = shift;
+#Jie's Tracing
+    if (defined $padb_trace) {
+	print "padb_trace: is_parent_resmgr($pid).\n";
+    }
+#endif
     my $parent_pid = find_from_status( $pid, 'PPid' );
     return is_resmgr_process($parent_pid);
 }
@@ -6218,27 +6863,33 @@ sub is_parent_resmgr {
 $SIG{PIPE} = 'IGNORE';
 
 sub gdb_start {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: gdb_start(@_).\n";
+    }
+#endif
     my ( $exe, $core ) = @_;
     my $gdb = {
         gdbpid   => -1,
         tracepid => -1,
         attached => 0,
         pa       => 0,
-        lang     => 'auto',
         debug    => 0,
         seq      => 1,
     };
+#original code
+#    my $cmd = 'gdb --interpreter=mi -q';
+#Jie's hack for anusf
 
-    if ( defined $inner_conf{backend_debugger} ) {
-        $gdb->{backend_debugger} = $inner_conf{backend_debugger};
-    } else {
-        $gdb->{backend_debugger} = $conf{backend_debugger};
-    }
+    my $cmd = "gdb --interpreter=mi -q";	
 
-    my $cmd = 'gdb --interpreter=mi -q';
-    if ( $gdb->{backend_debugger} eq 'idb' ) {
-        $cmd = 'idb --interpreter=mi2 -q';
-    }
+    #if (defined $pbs_gid) {
+	#    if (defined $padb_debug) {
+	#        print "pbs_gid is $pbs_gid.\n";
+	#    }
+	#    $cmd = "/opt/bin/nfnewgrp $pbs_gid gdb --interpreter=mi -q";
+    #}
+#end of Jie's hack
     if ( defined $core ) {
         $cmd .= " $exe $core";
     }
@@ -6255,6 +6906,11 @@ sub gdb_start {
 }
 
 sub gdb_quit {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: gdb_quit(@_).\n";
+    }
+#endif
     my ($gdb) = @_;
     if ( $gdb->{seq} == 1 ) {
         foreach my $fdname (qw(rdr wtr err)) {
@@ -6266,7 +6922,7 @@ sub gdb_quit {
         }
         return;
     }
-    gdb_send( $gdb, '-gdb-exit' );
+    gdb_send( $gdb, 'quit' );
     waitpid $gdb->{gdbpid}, 0;
     foreach my $fdname (qw(rdr wtr err)) {
         next unless exists $gdb->{$fdname};
@@ -6280,6 +6936,11 @@ sub gdb_quit {
 }
 
 sub gdb_attach {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: gdb_attach(@_).\n";
+    }
+#endif
     my ( $gdb, $pid ) = @_;
 
     if ($running_on_solaris) {
@@ -6291,11 +6952,7 @@ sub gdb_attach {
     }
 
     send_cont_signal($pid);
-    my %p = gdb_n_send( $gdb, "-target-attach $pid" );
-
-    if ( not defined $p{status} or $p{status} eq 'error' ) {
-        %p = gdb_n_send( $gdb, "attach $pid" );
-    }
+    my %p = gdb_n_send( $gdb, "attach $pid" );
 
     if ( not defined $p{status} ) {
         $gdb->{error} = 'Failed to attach to process';
@@ -6329,6 +6986,11 @@ sub gdb_attach {
 }
 
 sub gdb_attach_post {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: gdb_attach_post(@_).\n";
+    }
+#endif
     my ( $gdb, $pid ) = @_;
 
     $gdb->{attached} = 1;
@@ -6348,15 +7010,17 @@ sub gdb_attach_post {
         $gdb->{runtime}{mpich2} = 1;
     }
 
-    if ( $gdb->{backend_debugger} ne 'idb' ) {
-        gdb_n_send( $gdb, '-gdb-set print address off' );
-        gdb_n_send( $gdb, '-gdb-set language auto' );
-    }
+    gdb_n_send( $gdb, '-gdb-set print address off' );
 
     return;
 }
 
 sub gdb_attach_async_start {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: gdb_attach_async_start(@_).\n";
+    }
+#endif
     my ( $gdb, $pid ) = @_;
 
     if ($running_on_solaris) {
@@ -6369,23 +7033,21 @@ sub gdb_attach_async_start {
 
     send_cont_signal($pid);
 
-    _gdb_send_real_async_start( $gdb, "-target-attach $pid" );
+    _gdb_send_real_async_start( $gdb, "attach $pid" );
 
     return;
 }
 
 sub gdb_attach_async_end {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: gdb_attach_async_end(@_).\n";
+    }
+#endif
     my ( $gdb, $pid ) = @_;
 
-    my %p = _gdb_send_real_async_wait( $gdb, "-target-attach $pid" );
+    my %p = _gdb_send_real_async_wait( $gdb, "attach $pid" );
 
-    if ( $gdb->{backend_debugger} eq 'idb' ) {
-        gdb_attach_post( $gdb, $pid );
-        return $pid;
-    }
-    if ( not defined $p{status} or $p{status} eq 'error' ) {
-        %p = gdb_n_send( $gdb, "attach $pid" );
-    }
     if ( not defined $p{status} ) {
         $gdb->{error} = 'Failed to attach to process';
         if ( not find_exe('gdb') ) {
@@ -6419,10 +7081,15 @@ sub gdb_attach_async_end {
 }
 
 sub gdb_detach {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: gdb_detach(@_).\n";
+    }
+#endif
     my ($gdb) = @_;
     my $result = gdb_send( $gdb, '-target-detach' );
 
-    return if ( not defined $result or $result eq 'error' );
+    return if ( $result eq 'error' );
 
     $gdb->{attached} = 0;
 
@@ -6432,6 +7099,11 @@ sub gdb_detach {
 
 sub gdb_wait_for_prompt {
     my ($gdb) = shift;
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: gdb_wait_for_prompt($gdb).\n";
+    }
+#endif
     my $handle = $gdb->{rdr};
     while (<$handle>) {
 
@@ -6445,6 +7117,11 @@ sub gdb_wait_for_prompt {
 }
 
 sub _gdb_send_real {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: _gdb_send_real(@_).\n";
+    }
+#endif
     my ( $gdb, $cmd ) = @_;
     gdb_wait_for_prompt($gdb);
     my $handle = $gdb->{wtr};
@@ -6452,40 +7129,6 @@ sub _gdb_send_real {
     print {$handle} "$seq$cmd\n";
     if ( defined $gdb->{debugfd} ) {
         print { $gdb->{debugfd} } "$seq$cmd\n";
-    }
-    my %r = gdb_n_next_result( $gdb, $seq );
-    if (    $gdb->{backend_debugger} ne 'idb'
-        and $gdb->{attached}
-        and $r{seq} ne $seq )
-    {
-        croak(
-"Invalid sequence number from gdb, expecting $seq got $r{seq} cmd=\"$cmd\""
-        );
-    }
-    $r{cmd} = $cmd;
-    if ( $gdb->{debugfd} and defined $r{status} and $r{status} ne 'done' ) {
-        print Dumper \%r;
-    }
-    return %r;
-}
-
-sub _gdb_send_real_async_start {
-    my ( $gdb, $cmd ) = @_;
-    gdb_wait_for_prompt($gdb);
-    my $handle = $gdb->{wtr};
-    my $seq    = $gdb->{seq}++;
-    print {$handle} "$seq$cmd\n";
-    if ( defined $gdb->{debugfd} ) {
-        print { $gdb->{debugfd} } "$seq$cmd\n";
-    }
-    return;
-}
-
-sub _gdb_send_real_async_wait {
-    my ( $gdb, $cmd ) = @_;
-    my $seq = $gdb->{seq};
-    if ( $gdb->{backend_debugger} eq 'idb' ) {
-        return;
     }
     my %r = gdb_n_next_result( $gdb, $seq );
     if ( $gdb->{attached} and $r{seq} ne $seq ) {
@@ -6500,14 +7143,53 @@ sub _gdb_send_real_async_wait {
     return %r;
 }
 
+sub _gdb_send_real_async_start {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: _gdb_send_real_async_start(@_).\n";
+    }
+#endif
+    my ( $gdb, $cmd ) = @_;
+    gdb_wait_for_prompt($gdb);
+    my $handle = $gdb->{wtr};
+    my $seq    = $gdb->{seq}++;
+    print {$handle} "$seq$cmd\n";
+    if ( defined $gdb->{debugfd} ) {
+        print { $gdb->{debugfd} } "$seq$cmd\n";
+    }
+    return;
+}
+
+sub _gdb_send_real_async_wait {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: _gdb_send_real_async_wait(@_).\n";
+    }
+#endif
+    my ( $gdb, $cmd ) = @_;
+    my $seq = $gdb->{seq};
+    my %r = gdb_n_next_result( $gdb, $seq );
+    if ( $gdb->{attached} and $r{seq} ne $seq ) {
+        croak(
+"Invalid sequence number from gdb, expecting $seq got $r{seq} cmd=\"$cmd\""
+        );
+    }
+    $r{cmd} = $cmd;
+    if ( $gdb->{debugfd} and defined $r{status} and $r{status} ne 'done' ) {
+        print Dumper \%r;
+    }
+    return %r;
+}
+
 sub _gdb_set_print_address {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: _gdb_set_print_address(@_).\n";
+    }
+#endif
     my ( $gdb, $flag ) = @_;
 
     if ( $flag == $gdb->{pa} ) {
-        return;
-    }
-
-    if ( $gdb->{backend_debugger} eq 'idb' ) {
         return;
     }
 
@@ -6515,60 +7197,55 @@ sub _gdb_set_print_address {
 
     if ($flag) {
         _gdb_send_real( $gdb, '-gdb-set print address on' );
+#Jie's hack for Fortran code
+	_gdb_send_real( $gdb, "-gdb-set language c" );
+#end Jie's hack    
     } else {
         _gdb_send_real( $gdb, '-gdb-set print address off' );
     }
     return;
 }
 
-sub _gdb_set_lang {
-    my ( $gdb, $lang ) = @_;
-
-    if ( $lang eq $gdb->{lang} ) {
-        return;
-    }
-
-    if ( $gdb->{backend_debugger} eq 'idb' ) {
-        return;
-    }
-
-    $gdb->{lang} = $lang;
-
-    _gdb_send_real( $gdb, "-gdb-set language $lang" );
-
-    return;
-}
-
 sub gdb_n_send {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: gdb_n_send(@_).\n";
+    }
+#endif
     my ( $gdb, $cmd ) = @_;
     _gdb_set_print_address( $gdb, 0 );
-    _gdb_set_lang( $gdb, 'auto' );
-    return _gdb_send_real( $gdb, $cmd );
-}
-
-# Send a command in the c language
-sub gdb_send_c {
-    my ( $gdb, $cmd ) = @_;
-    _gdb_set_print_address( $gdb, 1 );
-    _gdb_set_lang( $gdb, 'c' );
     return _gdb_send_real( $gdb, $cmd );
 }
 
 # Send a command with print address enabled.
 sub gdb_send_addr {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: gdb_send_addr(@_).\n";
+    }
+#endif
     my ( $gdb, $cmd ) = @_;
     _gdb_set_print_address( $gdb, 1 );
-    _gdb_set_lang( $gdb, 'auto' );
     return _gdb_send_real( $gdb, $cmd );
 }
 
 sub gdb_send {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: gdb_send(@_).\n";
+    }
+#endif
     my ( $gdb, $cmd ) = @_;
     my %p = gdb_n_send( $gdb, $cmd );
     return $p{status};
 }
 
 sub gdb_strip_square {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: gdb_strip_square(@_).\n";
+    }
+#endif
     my $str = shift;
     if ( $str =~ m{\A\[(.*)\]\z}x ) {
         return $1;
@@ -6578,7 +7255,7 @@ sub gdb_strip_square {
 
 sub gdb_strip_braces {
     my ($str) = @_;
-    if ( $str =~ m{\A{(.*)}\z}x ) {
+    if ( $str =~ m{\A\{(.*)\}\z}x ) {
         return $1;
     }
     croak "Cannot strip curly braces from $str";
@@ -6818,6 +7495,11 @@ sub gdb_parse_reason {
 #########################################################################
 
 sub gdb_n_next_result {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: gdb_n_next_result(@_).\n";
+    }
+#endif
     my ($gdb) = @_;
     my $handle = $gdb->{rdr};
 
@@ -6838,7 +7520,7 @@ sub gdb_n_next_result {
         #if (/\&\"(.*)\"\n/) {    #"
         #    $res{debug} .= $1;
         #}
-        if (m{\A(\d+)\^(done|error|RESULT_UNKNOWN),?(.*)\Z}x) {
+        if (m{\A(\d+)\^(done|error),?(.*)\Z}x) {
             my $seq    = $1;
             my $status = $2;
             my $reason = $3;
@@ -6869,12 +7551,6 @@ sub gdb_n_next_result {
     #    chomp $res{debug};
     #}
 
-    # As idb doesn't confirm that it's attached properly it's impossible
-    # to do this test correctly here.
-    if ( $gdb->{backend_debugger} eq 'idb' ) {
-        return %res;
-    }
-
     if ( $gdb->{attached} ) {
         croak("Unexpected EOF from gdb");
     }
@@ -6883,6 +7559,11 @@ sub gdb_n_next_result {
 }
 
 sub gdb_strip_value {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: gdb_strip_value(@_).\n";
+    }
+#endif
     my ($str) = @_;
     if ( $str =~ m{\Avalue="([^"]+)"\z}x ) {
         return $1;
@@ -6902,7 +7583,7 @@ sub gdb_type_size {
 # adding extra text after the value which is causing hex to throw warnings.
 sub gdb_type_offset {
     my ( $gdb, $type, $field ) = @_;
-    my %p = gdb_send_c( $gdb,
+    my %p = gdb_send_addr( $gdb,
         "-data-evaluate-expression \"(void *)&(($type *)0)->$field\"" );
     return unless ( $p{status} eq 'done' );
     return hex gdb_strip_value( $p{reason} );
@@ -6918,16 +7599,11 @@ sub gdb_func_addr {
     return $hex;
 }
 
-# Somewhere between gdb 7.2.x and 7.5.x, gdb started printing additional
-# information at the end of the value= line that needs to be stripped off.
-# Strip this off by splitting on spaces and returning the first value.
 sub gdb_var_addr {
     my ( $gdb, $var ) = @_;
     my %p = gdb_send_addr( $gdb, "-data-evaluate-expression \"&($var)\"" );
     return unless ( $p{status} eq 'done' );
-    my $value = gdb_strip_value( $p{reason} );
-    my @a = split $SPACE, $value;
-    return $a[0];
+    return gdb_strip_value( $p{reason} );
 }
 
 sub gdb_read_raw {
@@ -6965,7 +7641,6 @@ sub gdb_string {
 
 sub gdb_read_pointer {
     my ( $gdb, $addr ) = @_;
-
     # Quote the request in case it contains spaces.
     my %t =
       gdb_send_addr( $gdb, "-data-evaluate-expression \"*(void **)$addr\"" );
@@ -6978,7 +7653,6 @@ sub gdb_read_pointer {
 
 sub gdb_read_int {
     my ( $gdb, $addr ) = @_;
-
     # Quote the request in case it contains spaces.
     my %t =
       gdb_send_addr( $gdb, "-data-evaluate-expression \"*(int *)$addr\"" );
@@ -6991,7 +7665,6 @@ sub gdb_read_int {
 
 sub gdb_read_value {
     my ( $gdb, $name ) = @_;
-
     # Quote the request in case it contains spaces.
     my %t = gdb_n_send( $gdb, "-data-evaluate-expression \"$name\"" );
     if ( $t{status} eq 'done' ) {
@@ -7003,7 +7676,6 @@ sub gdb_read_value {
 
 sub gdb_read_value_addr {
     my ( $gdb, $name ) = @_;
-
     # Quote the request in case it contains spaces.
     my %t = gdb_send_addr( $gdb, "-data-evaluate-expression \"$name\"" );
     if ( $t{status} eq 'done' ) {
@@ -7019,7 +7691,6 @@ sub gdb_read_value_addr {
 # if the struct entries.
 sub gdb_load_type {
     my ( $gdb, $type ) = @_;
-
     my %t = gdb_n_send( $gdb, "-var-create - * $type" );
 
     return unless ( defined $t{status} and $t{status} eq 'done' );
@@ -7043,6 +7714,11 @@ sub gdb_load_type {
 }
 
 sub minfo_handle_query {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: minfo_handle_query(@_).\n";
+    }
+#endif
     my ( $gdb, $vp, $query, $stats ) = @_;
 
     my ( undef, $cmd, @params ) = split $SPACE, $query;
@@ -7091,6 +7767,11 @@ sub minfo_handle_query {
 }
 
 sub run_minfo {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: run_minfo(@_).\n";
+    }
+#endif
     my ( $carg, $gdb, $vp ) = @_;
 
     my $h = {
@@ -7195,10 +7876,6 @@ sub run_minfo {
         if ( defined $bytes_to_read ) {
             $str_value .= $r;
             if ( length $str_value eq $bytes_to_read + 1 ) {
-
-                # Chomp twice here, once to remove the newline that minfo
-                # added, once to remove any newline from the message itself.
-                chomp $str_value;
                 chomp $str_value;
                 if ($str_global) {
                     $global{$str_name} = $str_value;
@@ -7288,33 +7965,6 @@ sub run_minfo {
             } else {
                 target_error( $vp, "UNPARSEABLE MINFO: $r" );
             }
-        } elsif ( $cmd eq 'col:' ) {
-            $stats{out}++;
-            if (
-                $r =~ m{\A
-                        col:
-                        [ ]
-                        id:(\d+)
-                        [ ]?
-                        count:(\d+)
-                        [ ]?
-                        active:(\d+)
-                        \z
-                        }x
-              )
-            {
-                my $call = {
-                    id     => $1,
-                    count  => $2,
-                    active => $3,
-                };
-
-                push @{ $communicator_descriptor{coll} }, $call;
-
-            } else {
-                target_error( $vp, "UNPARSEABLE MINFO: $r" );
-            }
-
         } elsif ( $cmd eq 'Msg:' ) {
             $stats{msg}++;
             if (
@@ -7388,7 +8038,6 @@ sub run_minfo {
         $stderr .= $_;
     }
     if ($have_error_messages) {
-        chomp($stderr);
         target_error( $vp, "Stderr from minfo:\n$stderr" );
     }
 
@@ -7420,14 +8069,12 @@ sub run_minfo {
 }
 
 sub minfo_to_array {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: minfo_to_array(@_).\n";
+    }
+#endif
     my ($cd) = @_;
-
-    my @coll_name_lookup = (
-        "Barrier",   "Bcast",    "Allgather", "Allgatherv",
-        "Allreduce", "Alltoall", "Alltoallv", "Reduce_Scatter",
-        "Reduce",    "Gather",   "Gatherv",   "Scan",
-        "Scatter",   "Scatterv"
-    );
 
     my @mq;
     foreach my $comm ( @{$cd} ) {
@@ -7445,13 +8092,6 @@ sub minfo_to_array {
         }
 
         my $mid = 0;
-
-        foreach my $cc ( @{ $comm->{coll} } ) {
-            my $coll_name = $coll_name_lookup[ $cc->{id} ];
-            my $active_desc = $cc->{active} ? "active" : "not active";
-            push @mq,
-"comm$comm->{mid}: Collective '$coll_name': call count $cc->{count}, $active_desc";
-        }
 
         foreach my $m ( @{ $comm->{messages} } ) {
             my @op_desc = qw(pending_send pending_receive unexpected_message);
@@ -7499,6 +8139,11 @@ sub minfo_to_array {
 # crashing (yes it does happen) is a common case for processes to be
 # stopped so always deliver this signal before and after attaching.
 sub send_cont_signal {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: send_cont_signal(@_).\n";
+    }
+#endif
     my $pid = shift;
     kill 'CONT', $pid;
     return;
@@ -7506,6 +8151,11 @@ sub send_cont_signal {
 
 # Returns the MPI queues for this process given a gdb handle.
 sub fetch_mpi_queue_gdb {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: fetch_mpi_queue_gdb(@_).\n";
+    }
+#endif
     my ( $carg, $vp, $pid, $g ) = @_;
     my @mq = run_minfo( $carg, $g, $vp );
     return @mq;
@@ -7515,6 +8165,12 @@ sub fetch_mpi_queue_gdb {
 # called but can't show the queues for any reason - most likely because it
 # isn't actually a quadrics system.
 sub show_mpi_queue {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: show_mpi_queue(@_).\n";
+    }
+#endif
+
     my ( $carg, $vp, $pid ) = @_;
 
     my $g = gdb_start();
@@ -7541,6 +8197,11 @@ sub show_mpi_queue {
 
 # The mode handler for message queue or deadlock detection mode.
 sub show_mpi_queue_one {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: show_mpi_queue_one(@_).\n";
+    }
+#endif
     my ( $carg, $proc ) = @_;
 
     my $vp  = $proc->{vp};
@@ -7558,11 +8219,16 @@ sub show_mpi_queue_one {
 }
 
 sub mpi_queue_output_handler {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: mpi_queue_output_handler(@_).\n";
+    }
+#endif
     my ( $carg, $lines, $three ) = @_;
 
     my %headers = (
-        ihqm            => 'Message from DLL (mqs_image_has_queues)',
-        phqm            => 'Message from DLL (mqs_process_has_queues)',
+        ihqm            => 'Message from DLL',
+        phqm            => 'Message from DLL',
         dllerror        => 'Error string from DLL',
         warning         => 'Warning message from minfo',
         dlldebugmessage => 'Debug message from DLL',
@@ -7597,6 +8263,11 @@ sub mpi_queue_output_handler {
 }
 
 sub mpi_go_deadlock_detect_helper {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: mpi_go_deadlock_detect_helper(@_).\n";
+    }
+#endif
     my $str        = shift;    # tagged onto the end of the line.
     my $possessive = shift;    # syntax to use (possessive/attributive)
     my $size       = shift;    # size of the group
@@ -7625,6 +8296,11 @@ sub mpi_go_deadlock_detect_helper {
 }
 
 sub mpi_go_deadlock_detect {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: mpi_go_deadlock_detect(@_).\n";
+    }
+#endif
     my ( $carg, $cd ) = @_;
 
     my %ad;
@@ -7777,6 +8453,11 @@ sub mpi_go_deadlock_detect {
 }
 
 sub mpi_deadlock_detect {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: mpi_deadlock_detect(@_).\n";
+    }
+#endif
     my ( $carg, $lines ) = @_;
     my $data;
 
@@ -7822,6 +8503,11 @@ sub mpi_deadlock_detect {
 }
 
 sub read_maps {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: read_maps(@_).\n";
+    }
+#endif
     my ($pid) = @_;
 
     my @regions;
@@ -7844,6 +8530,11 @@ sub read_maps {
 }
 
 sub describe_pointer {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: describe_pointer(@_).\n";
+    }
+#endif
     my ( $gdb, $ptr ) = @_;
 
     my $pval = _hex($ptr);
@@ -7866,6 +8557,11 @@ sub describe_pointer {
 }
 
 sub expand_var_hash {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: expand_var_hash(@_).\n";
+    }
+#endif
     my ( $gdb, $lookup, $type, $addr ) = @_;
     if ( defined $lookup->{$type} ) {
         my $fm = $lookup->{$type};
@@ -7883,6 +8579,11 @@ sub expand_var_hash {
 }
 
 sub custom_expand_var {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: custom_expand_var(@_).\n";
+    }
+#endif
     my ( $gdb, $type, $name, $addr ) = @_;
 
     my %lookup_generic = ( 'char *' => "%s", );
@@ -7916,6 +8617,11 @@ sub custom_expand_var {
 }
 
 sub gdb_expand_var {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: gdb_expand_var(@_).\n";
+    }
+#endif
     my ( $gdb, $arg ) = @_;
 
     # If you try and read a value which claims to be optimised away it
@@ -7966,10 +8672,6 @@ sub gdb_expand_var {
             return pretify_variable('null pointer');
         }
 
-        if ( $pointer eq '<optimized out>' ) {
-            return pretify_variable('<optimized out>');
-        }
-
         # Try and print the contents of the pointer, this works fine
         # for types like 'double *' but produces lots of data for more
         # complex types, check the length here and reject it now if we
@@ -8000,6 +8702,11 @@ sub gdb_expand_var {
 }
 
 sub gdb_expand_vars {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: gdb_expand_vars(@_).\n";
+    }
+#endif
     my ( $gdb, $frame, $type ) = @_;
 
     foreach my $arg ( @{ $frame->{$type} } ) {
@@ -8012,29 +8719,13 @@ sub gdb_expand_vars {
     return;
 }
 
-# As gdb_expand_vars but takes $vars as provided by gdb and populates the two
-# arrays from that.
-sub gdb_expand_vars_raw {
-    my ( $gdb, $frame, $vars ) = @_;
-
-    foreach my $arg ( @{$vars} ) {
-
-        my $value = gdb_expand_var( $gdb, $arg );
-        if ( defined $arg->{arg} ) {
-            push @{ $frame->{'params'} }, $arg;
-        } else {
-            push @{ $frame->{'locals'} }, $arg;
-        }
-        if ( defined $value ) {
-            $arg->{value} = $value;
-        }
-    }
-
-    return;
-}
-
 sub gdb_dump_frames {
-    my ( $gdb, $detail, $thread ) = @_;
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: gdb_dump_frames(@_).\n";
+    }
+#endif
+    my ( $gdb, $detail ) = @_;
     my %result = gdb_n_send( $gdb, '-stack-list-frames' );
     my $data = gdb_parse_reason( $result{reason}, 'frame' );
     if ( not defined $data->{stack} ) {
@@ -8042,28 +8733,10 @@ sub gdb_dump_frames {
     }
     if ( defined $detail ) {
         foreach my $frame ( @{ $data->{stack} } ) {
-
-            # Try the new way first, and if that works then great, if not then
-            # revert back to the old method.
-
-            my %all_vars = gdb_send_addr( $gdb,
-"-stack-list-variables --thread $thread --frame $frame->{level} 2"
-            );
-            if ( $all_vars{status} eq 'done' ) {
-                my $args = gdb_parse_reason( $all_vars{reason} );
-                gdb_expand_vars_raw( $gdb, $frame, $args->{variables} );
-                next;
-            }
-
             gdb_send( $gdb, "-stack-select-frame $frame->{level}" );
 
-            my $print_cmd = '2';
-            if ( $gdb->{backend_debugger} eq 'idb' ) {
-                $print_cmd = '1';
-            }
             my %r = gdb_send_addr( $gdb,
-"-stack-list-arguments $print_cmd $frame->{level} $frame->{level}"
-            );
+                "-stack-list-arguments 2 $frame->{level} $frame->{level}" );
             my $args = gdb_parse_reason( $r{reason} );
 
             if ( defined $args->{'stack-args'}[0]{frame}{args} ) {
@@ -8073,7 +8746,7 @@ sub gdb_dump_frames {
                 gdb_expand_vars( $gdb, $frame, 'params' );
             }
 
-            my %s = gdb_n_send( $gdb, '-stack-list-locals 2' );
+            my %s = gdb_n_send( $gdb, '-stack-list-locals --simple-values' );
             if ( $s{status} eq 'done' ) {
                 my $flocals = gdb_parse_reason( $s{reason} );
                 if ( defined $flocals->{locals} ) {
@@ -8087,6 +8760,11 @@ sub gdb_dump_frames {
 }
 
 sub gdb_dump_frames_per_thread {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: gdb_dump_frames_per_thread(@_).\n";
+    }
+#endif
     my ( $gdb, $detail, $thread_id ) = @_;
     my @th = ();
     my %result = gdb_n_send( $gdb, '-thread-list-ids' );
@@ -8104,7 +8782,7 @@ sub gdb_dump_frames_per_thread {
     # code here however.
     if ( $data->{'number-of-threads'} == 0 ) {
         my %t = ( id => 0 );
-        @{ $t{frames} } = gdb_dump_frames( $gdb, $detail, 0 );
+        @{ $t{frames} } = gdb_dump_frames( $gdb, $detail );
         push @th, \%t;
         return @th;
     }
@@ -8126,10 +8804,8 @@ sub gdb_dump_frames_per_thread {
             next unless $thread_id eq $id;
         }
         my %t = ( id => $id );
-        if ( $data->{'number-of-threads'} != 1 ) {
-            gdb_send( $gdb, "-thread-select $id" );
-        }
-        @{ $t{frames} } = gdb_dump_frames( $gdb, $detail, $t{id} );
+        gdb_send( $gdb, "-thread-select $id" );
+        @{ $t{frames} } = gdb_dump_frames( $gdb, $detail );
         push @th, \%t;
     }
     return @th;
@@ -8138,6 +8814,11 @@ sub gdb_dump_frames_per_thread {
 # I've not run this function for a while, it would probably benefit form
 # re-writing from scratch.
 sub stack_from_core {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: stack_from_core(@_).\n";
+    }
+#endif
     my $exe  = shift;
     my $core = shift;
 
@@ -8216,7 +8897,7 @@ sub stack_from_core {
                     }
                 }
             } else {
-                printf( ( $$frame{func} || '?' )
+                printf( ( $$frame{func} || '?' ) 
                     . '() at '
                       . ( $$frame{file} || '?' ) . ':'
                       . ( $$frame{line} || '?' )
@@ -8230,6 +8911,11 @@ sub stack_from_core {
 }
 
 sub run_ptrack_cmd {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: run_ptrack_cmd(@_).\n";
+    }
+#endif
     my ( $vp, $pid, $cmd ) = @_;
 
     my $lines = 0;
@@ -8248,6 +8934,11 @@ sub run_ptrack_cmd {
 }
 
 sub run_command {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: run_command(@_).\n";
+    }
+#endif
     my ( $vp, $cmd ) = @_;
     open my $CMDS, '-|', "$cmd" or p_die( $vp, 'cant fork subcommand' );
     while (<$CMDS>) {
@@ -8259,8 +8950,12 @@ sub run_command {
 }
 
 sub get_remote_env_bygdb {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	print "padb_trace: get_remote_env_bygdb(@_).\n";
+    }
+#endif
     my $pid = shift;
-
     my %env;
     my ( $fh, $filetmp ) = tempfile("/tmp/padb.XXXXXX");
     print $fh 'set pagination off';
@@ -8291,6 +8986,9 @@ sub get_remote_env_bygdb {
         next if (/^\[/);
         next if (/^Using\s+/i);
         next if (/^0x/i);
+#dsr900: Looks like this function can't handle blank env vars
+	next if (/=$/);
+#dsr900: end
         if (/=/) {
             chomp;
             my @f   = split "=";
@@ -8310,11 +9008,17 @@ sub get_remote_env_bygdb {
 }
 
 sub get_remote_env {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: get_remote_env(@_).\n";
+    }
+#endif
     my $pid = shift;
 
     my %env;
 
     local $/ = "\0";
+
     open my $FD, '<', "/proc/$pid/environ" or return;
     while (<$FD>) {
         chomp;
@@ -8322,13 +9026,22 @@ sub get_remote_env {
         my $key = $f[0];
         shift @f;
         $env{$key} = join q{=}, @f;
-    }
-    close $FD;
+        if (defined $padb_debug) {
+            print "key is $key, env(key) is $env{$key}.\n\n\n";
+        }
+     }
+     close $FD;
+
     return %env;
 }
 
 # Load the data about a given RMS job id, return a array of hashes
 sub load_rms_procs {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: load_rms_procs(@_).\n";
+    }
+#endif
     my $job = shift;
 
     # This is actually perfectly legitimate, it's because you can do for
@@ -8361,6 +9074,11 @@ sub load_rms_procs {
 }
 
 sub show_task_file {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: show_task_file(@_).\n";
+    }
+#endif
     my ( $vp, $file, $prefix ) = @_;
     return unless ( -f $file );
     my @all = slurp_file($file);
@@ -8378,6 +9096,11 @@ sub show_task_file {
 }
 
 sub show_task_stat_file {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: show_task_stat_file(@_).\n";
+    }
+#endif
     my ( $vp, $file ) = @_;
     my @stat_names =
       qw(pid comm state ppid pgrp session tty_nr tpgid flags minflt
@@ -8400,6 +9123,11 @@ sub show_task_stat_file {
 }
 
 sub show_task_cmdline {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: show_task_cmdline(@_).\n";
+    }
+#endif
     my ( $vp, $dir ) = @_;
 
     local $/ = "\0";
@@ -8414,6 +9142,11 @@ sub show_task_cmdline {
 }
 
 sub show_task_dir {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: show_task_dir(@_).\n";
+    }
+#endif
     my ( $carg, $vp, $pid, $dir ) = @_;
 
     if ( $carg->{proc_shows_proc} ) {
@@ -8495,6 +9228,11 @@ sub show_task_dir {
 
 # Convert the first line of /proc/stat to elapsed jiffies.
 sub string_to_jiffies {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: string_to_jiffies(@_).\n";
+    }
+#endif
     my ($ps) = @_;
 
     my @usecc = split $SPACE, $ps;
@@ -8510,6 +9248,11 @@ sub string_to_jiffies {
 }
 
 sub add_and_divide_jiffies {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: add_and_divide_jiffies(@_).\n";
+    }
+#endif
     my ( $pre, $post ) = @_;
 
     my $jiffies;
@@ -8520,6 +9263,11 @@ sub add_and_divide_jiffies {
 }
 
 sub pcpu_user {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: pcpu_user(@_).\n";
+    }
+#endif
     my ( $cpucount, $elapsed, $start, $end ) = @_;
     my @pre  = split $SPACE, $start;
     my @post = split $SPACE, $end;
@@ -8529,6 +9277,11 @@ sub pcpu_user {
 }
 
 sub pcpu_sys {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: pcpu_sys(@_).\n";
+    }
+#endif
     my ( $cpucount, $elapsed, $start, $end ) = @_;
     my @pre  = split $SPACE, $start;
     my @post = split $SPACE, $end;
@@ -8538,6 +9291,11 @@ sub pcpu_sys {
 }
 
 sub pcpu_total {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: pcpu_total(@_).\n";
+    }
+#endif
     my ( $cpucount, $elapsed, $start, $end ) = @_;
     my @pre  = split $SPACE, $start;
     my @post = split $SPACE, $end;
@@ -8549,6 +9307,11 @@ sub pcpu_total {
 my %proc_keys;
 
 sub proc_output {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: proc_output(@_).\n";
+    }
+#endif
     my ( $vp, $key, $value ) = @_;
     if ( $inner_conf{mode} eq 'proc_summary' ) {
         if ( defined $proc_keys{ lc $key } ) {
@@ -8561,6 +9324,11 @@ sub proc_output {
 }
 
 sub show_proc_all {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: show_proc_all(@_).\n";
+    }
+#endif
     my ( $carg, $list ) = @_;
 
     %proc_keys = ();
@@ -8712,6 +9480,11 @@ sub show_proc_all {
 }
 
 sub show_proc {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: show_proc(@_).\n";
+    }
+#endif
     my ( $carg, $vp, $pid ) = @_;
 
     if ( $carg->{proc_shows_proc} ) {
@@ -8741,6 +9514,11 @@ sub show_proc {
 }
 
 sub show_stack_vars {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: show_stack_vars(@_).\n";
+    }
+#endif
     my ( $vp, $frame, $type ) = @_;
     return unless defined $frame->{$type};
     return if ( @{ $frame->{$type} } == 0 );
@@ -8760,6 +9538,11 @@ sub show_stack_vars {
 # want gdb handles or not, if they do then this function attaches for
 # it, if they don't and gdb is attached this function will detach.
 sub global_attach {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: global_attach(@_).\n";
+    }
+#endif
     my ( $mode, $procs ) = @_;
 
     if ( not $allfns{$mode}{needs_gdb} ) {
@@ -8805,12 +9588,16 @@ sub global_attach {
 # Detach from all local processes, this function is called from both
 # global_attach and also when padb is exiting.
 sub global_detach {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: global_detach(@_).\n";
+    }
+#endif
     my ($procs) = @_;
 
     foreach my $proc ( @{$procs} ) {
         if ( defined $proc->{gdb_handle} ) {
             gdb_detach( $proc->{gdb_handle} );
-            gdb_quit( $proc->{gdb_handle} );
             delete $proc->{gdb_handle};
         }
     }
@@ -8833,6 +9620,12 @@ sub global_detach {
 # checking for the presence of one of the stack_strip_below functions in
 # the stack trace.
 sub stack_trace_from_pid {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: stack_trace_from_pid(@_).\n";
+    }
+#endif
+
     my ( $carg, $proc ) = @_;
 
     my @all;
@@ -8975,6 +9768,8 @@ sub stack_trace_from_pid {
               ( $frame->{file} || '?' ),
               ( $frame->{line} || '?' );
 
+            output( $vp, $l );
+
             if ( $carg->{out_format} eq 'tree' ) {
 
                 output_namespace( $vp, $thread->{id}, $l );
@@ -9028,8 +9823,6 @@ sub stack_trace_from_pid {
                     }
                 }
             } else {
-                output( $vp, $l );
-
                 if ( $carg->{stack_shows_params} ) {
                     show_stack_vars( $vp, $frame, 'params' );
                 }
@@ -9048,6 +9841,11 @@ sub stack_trace_from_pid {
 }
 
 sub thread_list_from_pid {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	        print "padb_trace: thread_list_from_pid(@_).\n";
+    }
+#endif
     my ( $carg, $proc ) = @_;
 
     return unless defined $proc->{gdb_handle};
@@ -9076,6 +9874,11 @@ sub thread_list_from_pid {
 }
 
 sub kill_proc {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: kill_proc(@_).\n";
+    }
+#endif
     my ( $cargs, $vp, $pid ) = @_;
     my $signal = uc $cargs->{signal};
     kill $signal, $pid;
@@ -9088,6 +9891,11 @@ sub kill_proc {
 
 # https://svn.open-mpi.org/trac/hwloc/ticket/21
 sub lstopo {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: lstopo(@_).\n";
+    }
+#endif
     my ( $cargs, $vp, $pid ) = @_;
 
     if ( $cargs->{lstopo_show_warning} ) {
@@ -9121,6 +9929,11 @@ sub lstopo {
 }
 
 sub run_cmd_against_target {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: run_cmd_against_target(@_).\n";
+    }
+#endif
     my ( $cargs, $rank, $pid ) = @_;
 
     my $cmd = $cargs->{command};
@@ -9137,6 +9950,11 @@ sub run_cmd_against_target {
 }
 
 sub ping_rank {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: ping_rank(@_).\n";
+    }
+#endif
     my ( $cargs, $vp, $pid ) = @_;
     target_key_pair( $vp, 'ping', 'ACK' );
     output( $vp, 'ACK' );
@@ -9144,6 +9962,11 @@ sub ping_rank {
 }
 
 sub qsnet_show_tport_queue {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: qsnet_show_tport_queue(@_).\n";
+    }
+#endif
     my ( $carg, $vp, $pid ) = @_;
 
     # If edb isn't installed (this isn't a Quadrics system) don't even try
@@ -9179,12 +10002,22 @@ sub qsnet_show_tport_queue {
 }
 
 sub show_full_stack {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: show_full_stack(@_).\n";
+    }
+#endif
     my ( $vp, $pid, $file ) = @_;
     run_ptrack_cmd( $vp, $pid, "gdb -batch -x $file -p $pid" );
     return;
 }
 
 sub show_full_stacks {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: show_full_stacks(@_).\n";
+    }
+#endif
     my ( $carg, $list ) = @_;
 
     my ( $fh, $file ) = tempfile('/tmp/padb.XXXXXXXX');
@@ -9201,6 +10034,11 @@ sub show_full_stacks {
 }
 
 sub set_debug {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: set_debug(@_).\n";
+    }
+#endif
     my ( $carg, $vp, $pid ) = @_;
     run_command( $vp,
         "edb --key $inner_conf{key} --debug=$carg->{dflag} --target-vp=$vp" );
@@ -9221,6 +10059,11 @@ EOF
 
 # Load a file for use in MPI_Watch.
 sub mpi_watch_load {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: mpi_watch_load(@_).\n";
+    }
+#endif
     my ($carg) = @_;
 
     # File is a csv file,
@@ -9279,6 +10122,11 @@ sub mpi_watch_load {
 # nicely rather than perpetually spew errors to the console.
 
 sub mpi_watch_all {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: mpi_watch_all(@_).\n";
+    }
+#endif
 
     my ( $carg, $list ) = @_;
     my $fns = mpi_watch_load($carg);
@@ -9382,9 +10230,7 @@ sub mpi_watch_all {
             my @frames = @{ $thread->{frames} };
             foreach my $i ( reverse 0 .. $#frames ) {
                 my $frame = $frames[$i];
-                if (    defined $frame->{func}
-                    and defined $fns->{fns}{ $frame->{func} } )
-                {
+                if ( defined $fns->{fns}{ $frame->{func} } ) {
                     $fnmode = $fns->{fns}{ $frame->{func} };
                     last;
                 }
@@ -9415,16 +10261,23 @@ sub mpi_watch_all {
 # called with the pid of 'sh', padb will then walk the process tree to
 # find the more interesting child process and target that one.
 sub register_target_process {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: register_target_process(@_).\n";
+    }
+#endif
     my ( $rank, $pid ) = @_;
 
-    if ( $pid == $$ ) {
-        croak("Error locating processes, refusing to debug self");
-    }
     $inner_conf{rmpids}{$pid}{rank} = $rank;
     return;
 }
 
 sub find_from_status {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: find_from_status(@_).\n";
+    }
+#endif
     my ( $pid, $key ) = @_;
 
     if ($running_on_solaris) {
@@ -9451,6 +10304,11 @@ sub find_from_status {
 }
 
 sub hash_from_status {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: hash_from_status(@_).\n";
+    }
+#endif
     my ($pid) = @_;
     my %status;
     my @pairs = slurp_file("/proc/$pid/status");
@@ -9464,6 +10322,11 @@ sub hash_from_status {
 }
 
 sub is_resmgr_process {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: is_resmgr_process(@_).\n";
+    }
+#endif
     my $pid  = shift;
     my $name = find_from_status( $pid, 'Name' );
     my $mgrs = {
@@ -9473,7 +10336,11 @@ sub is_resmgr_process {
         pbs_attach => 1,
         orted      => 1,
         mpirun     => 1,
-        pmi_proxy  => 1,
+#Jie's hack for mpiexec
+	mpiexec    => 1,
+#Jie's addition for HPMPI
+        mpid     => 1,
+#end of Jie's addition
     };
     return 1 if ( defined $mgrs->{$name} );
     return;
@@ -9483,6 +10350,11 @@ sub is_resmgr_process {
 # anything at this stage.
 sub slurm_find_pids {
     my $jobid = shift;
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: slurm_find_pids($jobid).\n";
+    }
+#endif
 
     my @procs =
       slurp_cmd("scontrol listpids $jobid.$inner_conf{slurm_job_step}");
@@ -9493,7 +10365,6 @@ sub slurm_find_pids {
         my ( $pid, $job, $step, undef, $global ) = split $SPACE, $proc;
         next if ( $global eq '-' );
         next unless ( $job eq $jobid );
-        next if ( $pid == $$ );
         next unless ( $step == $inner_conf{slurm_job_step} );
         next if ( is_resmgr_process($pid) );
         register_target_process( $global, $pid );
@@ -9526,30 +10397,18 @@ sub slurm_find_pids {
         next unless defined $env{SLURM_JOB_ID};
         next if ( $env{SLURM_JOB_ID} != $jobid );
 
-        if ( defined $env{OMPI_COMM_WORLD_RANK} ) {
-            # If this is defined check it's correct, it might be missing though.
-            if ( defined $env{SLURM_JOB_STEP} ) {
-                next if $env{SLURM_JOB_STEP} != $inner_conf{slurm_job_step};
-            }
+        next unless defined $env{OMPI_COMM_WORLD_RANK};
 
-            if ( defined $env{OMPI_COMM_WORLD_SIZE} ) {
-                target_key_pair( $vp, "JOB_SIZE", $env{OMPI_COMM_WORLD_SIZE} );
-            }
-
-            register_target_process( $env{OMPI_COMM_WORLD_RANK}, $pid );
-        } elsif ( defined $env{PMI_RANK} ) {
-
-            # If this is defined check it's correct, it might be missing though.
-            if ( defined $env{SLURM_JOB_STEP} ) {
-                next if $env{SLURM_JOB_STEP} != $inner_conf{slurm_job_step};
-            }
-
-            if ( defined $env{PMI_SIZE} ) {
-                target_key_pair( $vp, "PMI_SIZE", $env{PMI_SIZE} );
-            }
-
-            register_target_process( $env{PMI_RANK}, $pid );
+        # If this is defined check it's correct, it might be missing though.
+        if ( defined $env{SLURM_JOB_STEP} ) {
+            next if $env{SLURM_JOB_STEP} != $inner_conf{slurm_job_step};
         }
+
+        if ( defined $env{OMPI_COMM_WORLD_SIZE} ) {
+            target_key_pair( $vp, "JOB_SIZE", $env{OMPI_COMM_WORLD_SIZE} );
+        }
+
+        register_target_process( $env{OMPI_COMM_WORLD_RANK}, $pid );
     }
 
     return;
@@ -9580,15 +10439,38 @@ sub slurm_find_pids {
 #
 #
 sub is_parent_resmgr_pbs {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: is_parent_resmgr_pbs(@_).\n";
+    }
+#endif
     my $input_pid = shift;
     my $result;
     my $parent_pid = find_from_status( $input_pid, 'PPid' );
     my $name_pid   = find_from_status( $input_pid, 'Name' );
+    if (defined $padb_debug) {
+	print "padb_debug: input_pid ($input_pid) is $name_pid has parent PPid ($parent_pid).\n";
+    }
+
     return
       if ( !defined($parent_pid)
-        || $parent_pid == 1
-        || $parent_pid == 0
-        || $name_pid eq 'pbs_attach' );
+	   || $parent_pid == 1
+	   || $parent_pid == 0
+	   || $name_pid eq 'pbs_attach' 
+#Jie's addition for anupbs
+	   || $name_pid eq 'mpirun'
+	   || $name_pid eq 'mpiexec'
+	   || $name_pid eq 'orted'
+	   || $name_pid eq 'mpid' 
+#end Jie's addition
+#dsr900 addition for Intel-MPI
+	   || $name_pid eq 'mpiexec.hydra'
+	   || $name_pid eq 'pmi_proxy'
+#end dsr900 addition
+#dsr900 addition for Intel-MPI 2019
+	   || $name_pid eq 'hydra_pmi_proxy'
+#end dsr900 addition
+	   );
 
     # loop to find its parents
     my $pid  = $parent_pid;
@@ -9598,14 +10480,39 @@ sub is_parent_resmgr_pbs {
         # find PPid of this pid
         my $ppid = find_from_status( $pid, 'PPid' );
         my @name = slurp_file("/proc/$pid/cmdline");
+        #dsr900 - pid 1 is not in PBS pid namespaces, so we cannot
+        # read /proc/ppid/ files sometimes. If that happens, bail.
+        if (!@name) {
+            last;
+        } 
         $loop++;
         my $line = $name[0];
         my @champs = split( /\0+/, $line );
+
+	    if (defined $padb_debug) {
+	        print "champs[0] is $champs[0].\n";
+	    }
         if ( $loop == 1 ) {
-            if ( $champs[0] eq 'pbs_attach' ) {
-                $result = 1;    # OK parent is resm
-                last;
-            }
+# original code
+#            if ( $champs[0] eq 'pbs_attach' ) {
+#		$result = 1;    # OK parent is resm
+#		last;
+#	    }
+# Jie's hack for anupbs
+	        my @words = split(/\//, $champs[0]);
+	        my $word;
+	        foreach $word (@words) {
+#dsr900: add Intel-MPI support
+#		if ( $word eq 'mpirun' || $word eq 'orted' || $word eq 'mpid' || $word eq 'mpiexec') {
+		        if ( $word eq 'mpirun' || $word eq 'orted' || $word eq 'mpid' || $word eq 'mpiexec' || $word eq 'mpiexec.hydra' || $word eq 'pmi_proxy' || $word eq 'hydra_pmi_proxy' ) {
+		            $result = 1;    # OK parent is resm
+		            last;
+		        }
+	        }
+	        if ( defined $result) {
+		        last;
+	        }
+#end of Jie's hack
             if ( $ppid == 1 || $ppid == 0 ) {
                 last;           # parent is root last anyway
             }
@@ -9624,10 +10531,18 @@ sub is_parent_resmgr_pbs {
 
 #
 sub pbs_find_pids {
-    my $job = shift;
+#Jie's Tracing
+    if (defined $padb_trace) {
+	print "padb_trace: pbs_find_pids(@_).\n";
+    }
+#endif
+   my $job = shift;
 
     if ( defined $inner_conf{pbs_server} ) {
-        $job .= ".$inner_conf{pbs_server}";
+        #dsr900 - Only append server name if the job doesn't end with it already
+        if ( $inner_conf{pbs_server} ne substr $job, -length($inner_conf{pbs_server} ) ) {
+            $job .= ".$inner_conf{pbs_server}";
+        }
     }
 
     my %vps;
@@ -9641,14 +10556,37 @@ sub pbs_find_pids {
         # Skip over ones which aren't direct descendants of a resource manager
         next unless is_parent_resmgr_pbs($pid);
 
+	if ( defined $padb_debug ) {	
+	    print "process $pid has a resmgr parent.\n";
+	}
+
         my $vp;
         my %env = get_remote_env($pid);
-        if ( !defined( $env{PBS_JOBID} ) || !defined( $env{PMI_RANK} ) ) {
+# original code
+#        if ( !defined( $env{PBS_JOBID} ) || !defined( $env{PMI_RANK} ) ) {
+#Jie's hack for anupbs, using openmpi and hpmpi
+#dsr900: Added Intel-MPI compatibility
+        if ( !defined( $env{PBS_JOBID} ) || 
+	     ( !defined( $env{OMPI_COMM_WORLD_RANK} ) && !defined( $env{PMI_RANK} ) ) ) {
+#dsr900: end
+#endof Jie's hack
             %env = get_remote_env_bygdb($pid);
         }
-
         if ( defined( $env{PBS_JOBID} ) && $env{PBS_JOBID} eq $job ) {
-            $vp = $env{PMI_RANK};
+# original code
+#            $vp = $env{PMI_RANK};
+#Jie's hack for anupbs
+#dsr900: added Intel-MPI compatibility
+	    if ( defined ( $env{OMPI_COMM_WORLD_RANK} ) ) {
+		$vp = $env{OMPI_COMM_WORLD_RANK};
+	    } elsif ( defined ( $env{PMI_RANK} ) ) {
+		$vp = $env{PMI_RANK};
+	    }
+	    if (defined $padb_debug) {
+		print "vp is $vp.\n"
+	    }
+#dsr900: end
+#end of Jie's hack
         }
         if ( defined $vp ) {
             $vps{$vp} = $pid;
@@ -9665,6 +10603,12 @@ sub pbs_find_pids {
 # LSF-openmpi support and LSF-mpich2
 #
 sub lsfmpi_get_proc {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: lsfmpi_get_proc(@_).\n";
+    }
+#endif
+
     my $job = shift;
     my @proc;
     my $rank_pid  = 1;
@@ -9708,6 +10652,12 @@ sub lsfmpi_get_proc {
 }
 
 sub lsfmpi_find_pids {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: lsfmpi_find_pids(@_).\n";
+    }
+#endif
+
     my $job = shift;
     my %vps;
 
@@ -9754,6 +10704,11 @@ sub lsfmpi_find_pids {
 }
 
 sub rms_find_pids {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: rms_find_pids(@_).\n";
+    }
+#endif
     my $jobid = shift;
 
     my %vps;
@@ -9810,6 +10765,11 @@ sub rms_find_pids {
 }
 
 sub inner_show_stats {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: inner_show_stats(@_).\n";
+    }
+#endif
     my $jobid = shift;
     my $key   = ( $jobid << 9 ) - 1;
     run_command( undef,
@@ -9821,6 +10781,11 @@ sub inner_show_stats {
 # Receive a reply from a child.  If it's the last reply then combine with
 # others and forward to parent.
 sub reply_from_child {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: reply_from_child(@_).\n";
+    }
+#endif
     my ( $handle, $sd, $req ) = @_;
 
     # If it's the first connection over this socket simply foreward on the
@@ -9894,10 +10859,18 @@ sub reply_from_child {
         if ( exists $handle->{all_replys}->{target_data} ) {
             foreach my $key ( keys %{ $r->{target_data} } ) {
                 foreach my $value ( keys %{ $r->{target_data}{$key} } ) {
-                    $handle->{all_replys}->{target_data}{$key}{$value} =
-                      rng_merge(
-                        $handle->{all_replys}->{target_data}{$key}{$value},
-                        $r->{target_data}{$key}{$value} );
+                    if (
+                        defined $handle->{all_replys}
+                        ->{target_data}{$key}{$value} )
+                    {
+                        rng_merge(
+                            $handle->{all_replys}->{target_data}{$key}{$value},
+                            $r->{target_data}{$key}{$value}
+                        );
+                    } else {
+                        $handle->{all_replys}->{target_data}{$key}{$value} =
+                          $r->{target_data}{$key}{$value};
+                    }
                 }
             }
         } else {
@@ -9908,9 +10881,13 @@ sub reply_from_child {
     # Merge in local target responses.
     foreach my $key ( keys %local_target_data ) {
         foreach my $value ( keys %{ $local_target_data{$key} } ) {
-            $handle->{all_replys}->{target_data}{$key}{$value} =
-              rng_merge( $handle->{all_replys}->{target_data}{$key}{$value},
-                $local_target_data{$key}{$value} );
+            if ( defined $handle->{all_replys}->{target_data}{$key}{$value} ) {
+                rng_merge( $handle->{all_replys}->{target_data}{$key}{$value},
+                    $local_target_data{$key}{$value} );
+            } else {
+                $handle->{all_replys}->{target_data}{$key}{$value} =
+                  $local_target_data{$key}{$value};
+            }
         }
     }
 
@@ -9937,6 +10914,11 @@ sub reply_from_child {
 }
 
 sub proc_link {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: proc_link(@_).\n";
+    }
+#endif
     my $pid = shift;
     my $path;
     if ($running_on_solaris) {
@@ -9944,18 +10926,30 @@ sub proc_link {
     } else {
         $path = "/proc/$pid/exe";
     }
-    return readlink $path;
+
+    return readlink $path;    
 }
 
 # Convert from a pid to a command name and do it in a safe manner to avoid
 # warnings.  suid programs tend to have the exe link which is un-readable
 # so if that yields nothing then load the name from the status file.
 sub pid_to_name {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: pid_to_name(@_).\n";
+    }
+#endif
     my $pid = shift;
     my $exe = proc_link($pid);
+    if (defined $padb_debug) {
+	print "exe from readlink is $exe.\n";
+    }
     if ( defined $exe ) {
         return basename($exe);
     } else {
+	if (defined $padb_debug) {
+	    print "find_from_status is used for pid ($pid).\n";
+	}
         return find_from_status( $pid, 'Name' );
     }
     return;
@@ -9965,6 +10959,11 @@ sub pid_to_name {
 # more interesting pids, in particular look for pids which appear to be
 # scripts and, if they have any children, look at the children instead.
 sub convert_pids_to_child_pids {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: convert_pids_to_child_pids(@_).\n";
+    }
+#endif
     my %process_data = get_extended_process_list( getpwuid $< );
 
     my %scripts;
@@ -10000,10 +10999,20 @@ sub convert_pids_to_child_pids {
         my $name = pid_to_name($pid);
         next unless defined $name;
 
+	    if (defined $padb_debug) {
+	        print "rmpid is $rmpid, name is $name.\n";
+	    }
+
         if ( defined $scripts{$name} ) {
             push @{ $ipids->{$rmpid}{scripts} }, $pid;
+	        if (defined $padb_debug) {
+		        print "script pid is $pid.\n";
+	        }	    
         } else {
             push @{ $ipids->{$rmpid}{notscripts} }, $pid;
+	        if (defined $padb_debug) {
+		        print "notscripts pid is $pid.\n";
+	        }	    
         }
     }
 
@@ -10050,6 +11059,11 @@ sub convert_pids_to_child_pids {
 # Find and report pids as part of the signon protocol, we should also
 # report name
 sub inner_find_pids {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: inner_find_pids(@_).\n";
+    }
+#endif
     my ( $netdata, $cmd ) = @_;
 
     if ( defined $cmd->{pd} ) {
@@ -10116,6 +11130,11 @@ sub inner_find_pids {
 # 2) Execute it.
 # 3) If we have no children send reply.
 sub command_from_parent {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: command_from_parent(@_).\n";
+    }
+#endif
     my ( $netdata, $cmd ) = @_;
 
     $netdata->{host_responce} = 'ok';
@@ -10294,6 +11313,11 @@ sub command_from_parent {
 
 # Time for the inner process to exit, cleanup all sockets and quit.
 sub inner_cleanup_and_exit {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: inner_cleanup_and_exit(@_).\n";
+    }
+#endif
     my $netdata = shift;
     foreach my $h ( $netdata->{sel}->handles() ) {
         $h->flush();
@@ -10304,6 +11328,11 @@ sub inner_cleanup_and_exit {
 
 # Send a reply to our parent, put a status of "ok" on for this host.
 sub reply_to_parent {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: reply_to_parent(@_).\n";
+    }
+#endif
     my ( $netdata, $cmd ) = @_;
 
     $cmd->{host_responce}{ $netdata->{host_responce} }
@@ -10318,6 +11347,11 @@ sub reply_to_parent {
 # is probably our parent (who may be the outer process) but it needs to be
 # authenticated.
 sub command_from_outer {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: command_from_outer(@_).\n";
+    }
+#endif
     my ( $netdata, $cdata, $line ) = @_;
 
     my $s = $cdata->{socket};
@@ -10384,9 +11418,14 @@ sub command_from_outer {
 
 # Loop forever in the inner process.
 sub inner_loop_for_comms {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	        print "padb_trace: inner_loop_for_comms(@_).\n";
+    }
+#endif
     my ($outerloc) = @_;
 
-    my $server = create_local_port( $inner_conf{port_range}, 4 );
+    my $server = create_local_port( $inner_conf{port_range} );
 
     my $lport    = $server->sockport();
     my $hostname = $inner_conf{hostname};
@@ -10462,7 +11501,7 @@ sub inner_loop_for_comms {
                 my $count = sysread $s, $d, 65536;
 
                 # Dead connection.
-                if ( not defined $d or not defined $count or $count == 0 ) {
+                if ( not defined $d or $count == 0 ) {
 
                     if ( eof $s ) {
                         $sel->remove($s);
@@ -10504,6 +11543,11 @@ sub inner_loop_for_comms {
 }
 
 sub inner_main {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: inner_main(@_).\n";
+    }
+#endif
 
     $inner_conf{hostname} = hostname();
 
@@ -10557,6 +11601,12 @@ sub inner_main {
 # it's the only code that needs it so far.
 
 sub to_arg {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: to_arg(@_).\n";
+    }
+#endi
+
     my $arg = shift;
     my $res = "$arg->{arg_long}";
     $res =~ s{_}{-}gx;
@@ -10570,6 +11620,11 @@ sub to_arg {
 }
 
 sub common_main {
+#Jie's Tracing
+    if (defined $padb_trace) {
+	    print "padb_trace: common_main(@_).\n";
+    }
+#endif
 
     # The quasi-authoritative list of modes padb can operate in.
 
@@ -10622,7 +11677,6 @@ sub common_main {
     };
 
     $allfns{mqueue} = {
-        out_handler => \&mpi_queue_output_handler,
         handler_one => \&show_mpi_queue_one,
         needs_gdb   => 1,
         arg_long    => 'mpi-queue',
